@@ -16,28 +16,30 @@
     @media (pointer: coarse) { .pad { display: flex; } }
     .pad button {
         font: 11px "Press Start 2P", monospace; color: #f4f4f8; background: #1d1d30;
-        border: 2px solid #44446a; border-radius: 6px; min-width: 60px; min-height: 56px;
+        border: 2px solid #44446a; border-radius: 6px; min-width: 50px; min-height: 56px;
         touch-action: none; user-select: none; -webkit-user-select: none;
     }
     .pad button:active { background: #36365a; }
 </style>
 </head>
 <body>
-<canvas id="screen" aria-label="Sky Hop. Arrow keys or A and D to move, Space to jump and to let go of a rope, S to go down a tunnel door."></canvas>
+<canvas id="screen" aria-label="Sky Hop. Arrow keys or A and D to move, Space to jump and to let go of a rope, S to go down a tunnel door, F to throw fireballs at a boss."></canvas>
 <div class="pad">
     <button data-key="a" aria-label="Move left">&lt;</button>
     <button data-key=" ">JUMP</button>
     <button data-key="w">FLAP</button>
     <button data-key="s" aria-label="Drop, or go into a door">DOWN</button>
+    <button data-key="f" aria-label="Throw a fireball at the boss">FIRE</button>
     <button data-key="d" aria-label="Move right">&gt;</button>
 </div>
 <script type="module">
 // the 16-bit Sky Hop: the same rules as the terminal game (game.mjs), drawn as pixel art
 // run it with: node serve.mjs, then open http://localhost:8765
 import { autopilot } from "./autopilot.mjs";
-import { BOLT_STRIKE, CRUMBLE_TICKS, H, HANDS, TICK_MS, W, WARP_TICKS, doorAt, input, newGame, scoreOf, sectionOf, step } from "./game.mjs";
+import { BOLT_STRIKE, CRUMBLE_TICKS, H, HANDS, TICK_MS, W, WARP_TICKS, doorAt, input, lapOf, newGame, scoreOf, sectionOf, step } from "./game.mjs";
+import { STRIKE_WARNING, updateSky } from "./hazards.mjs";
 import { codeLine, eraOf, placeOf, themeOf, wordFor } from "./places.mjs";
-import { DISASTERS, WEATHERS, weatherAt } from "./weather.mjs";
+import { DISASTERS, WEATHERS } from "./weather.mjs";
 
 // one cell of the game's grid is 8 x 12 pixels, so the window is 352 x 240 under a 16 pixel score bar
 const CW = 8;
@@ -50,7 +52,8 @@ const INK = "#0b0b14";
 const CLAUDE = { body: "#d97757", light: "#eda183", shade: "#b0573a", ink: "#2b1209", eye: "#141414" };
 
 const canvas = document.getElementById("screen");
-const ctx = canvas.getContext("2d");
+// let, not const: a boss is drawn onto a canvas of its own first (see drawBoss)
+let ctx = canvas.getContext("2d");
 canvas.width = VW;
 canvas.height = VH;
 
@@ -93,7 +96,9 @@ try {
 } catch {
     // no saved best in this browser; the game itself is fine
 }
-const g = newGame();
+const params = new URLSearchParams(location.search);
+// ?world=5 starts in the fifth world, for a look at it and its boss
+const g = newGame(undefined, { world: Math.max(0, Math.floor(Number(params.get("world")) || 1) - 1) });
 
 const saveBest = () => {
     if (g.assisted || scoreOf(g) <= record) return;
@@ -131,7 +136,7 @@ const release = (key) => {
 const KEYS = {
     ArrowLeft: "a", KeyA: "a", ArrowRight: "d", KeyD: "d",
     Space: " ", ArrowUp: "w", KeyW: "w", ArrowDown: "s", KeyS: "s",
-    Enter: "\r", Tab: "\t", KeyR: "r", KeyM: "m",
+    Enter: "\r", Tab: "\t", KeyR: "r", KeyM: "m", KeyF: "f", KeyE: "e",
 };
 addEventListener("keydown", (e) => {
     const key = KEYS[e.code];
@@ -207,23 +212,20 @@ function noise(dur = 0.35, vol = 0.12) {
     source.start();
 }
 
-// ---- the weather: its own seed and its own clock, so it carries on through a restart and never touches the rules ----
+// ---- the weather: the game's own (see hazards.mjs), since some of it is part of the rules; here it's drawn and heard ----
 
-const WEATHER_SEED = (Math.random() * 2 ** 31) | 0;
+// the weather's pictures move on their own clock, so the rain still falls on the title screen and after a game over
 let weatherTicks = 0;
 // ?sky=rain (or snow, volcano, meteor-shower...) holds one weather or disaster on for a look at it
-const params = new URLSearchParams(location.search);
 const heldSky = (params.get("sky") ?? "").replace(/-/g, " ").toLowerCase();
-const skyNow = (t) => {
-    const real = weatherAt(WEATHER_SEED, t);
-    if (WEATHERS.includes(heldSky)) return { ...real, weather: heldSky, amount: 1 };
-    if (DISASTERS.includes(heldSky)) return { ...real, disaster: heldSky, power: 1, age: real.disaster === heldSky ? real.age : 100 };
-    return real;
-};
-let sky = skyNow(0);
+if (WEATHERS.includes(heldSky) || DISASTERS.includes(heldSky)) {
+    g.holdSky = heldSky;
+    updateSky(g);
+}
+let sky = g.sky;
 // a thunderstorm's lightning comes in windows of this many ticks, and lights up the start of some of them
 const THUNDER_EVERY = 36;
-const thunderIn = (t) => sky.weather === "thunderstorm" && sky.amount > 0.4 && hash(Math.floor(t / THUNDER_EVERY) * 7 + WEATHER_SEED) < 0.35;
+const thunderIn = (t) => sky.weather === "thunderstorm" && sky.amount > 0.4 && hash(Math.floor(t / THUNDER_EVERY) * 7 + g.skySeed) < 0.35;
 const thunderNow = (t) => thunderIn(t) && mod(t, THUNDER_EVERY) < 4;
 
 // ---- what happened this tick: sounds, dust and sparkles ----
@@ -295,6 +297,46 @@ function events(before) {
         flash = 0.35;
         noise(0.25, 0.08);
     }
+    // a meteor or a lava bomb coming down: a thud, a shake, and rubble or sparks thrown up
+    for (const i of g.impacts) {
+        if (i.t !== 11) continue;
+        shake = Math.max(shake, i.kind === "meteor" ? 5 : 3);
+        noise(0.35, i.kind === "meteor" ? 0.09 : 0.05);
+        puff(i.x + 1.5, i.y, 10, i.kind === "meteor" ? "#8a7360" : "#ff7a1a", 0.35, 0.25);
+    }
+    if (g.strikes.some((s) => s.t === STRIKE_WARNING - 1)) tone([880, 660], 0.05, "square", 0.025);
+    fightEvents(before);
+}
+
+// a fight's sounds: the boss turning up, every fireball and hit, Claude hurt, and the boss going down
+function fightEvents(before) {
+    const f = g.fight;
+    const was = before.fight;
+    if (f && !was) tone([131, 165, 131, 98, 131], 0.14, "square", 0.05);
+    if (!f) {
+        if (was && g.phase === "playing") {
+            tone([523, 659, 784, 1047, 784, 1047, 1319], 0.09, "square", 0.05);
+            shake = 6;
+        }
+        return;
+    }
+    const b = f.boss;
+    if (f.shots.length > before.shots) tone([1175, 880], 0.03, "square", 0.025);
+    if (b.hp < before.hp) {
+        noise(0.06, 0.05);
+        puff(b.x + b.w / 2, b.y + b.h / 2, 3, "#ff9a3a", 0.25, 0.1);
+    }
+    if (f.hearts < before.hearts) {
+        tone([392, 262, 196], 0.07, "sawtooth", 0.05);
+        shake = 5;
+        puff(g.claude.x + 2.5, g.claude.y + 1, 8, CLAUDE.body, 0.3, 0.15);
+    }
+    if (b.dying && !before.dying) {
+        noise(0.7, 0.1);
+        shake = 8;
+    }
+    // it comes apart in bursts as it goes
+    if (b.dying && mod(b.dying, 6) === 0) puff(b.x + Math.random() * b.w, b.y + Math.random() * b.h, 10, b.big ? "#ff8a5a" : "#ffd84a", 0.4, 0.2);
 }
 
 // the weather's sounds: thunder after a flash, and a low rumble through an earthquake
@@ -310,19 +352,29 @@ let prev = null;
 function snapshot() {
     const xs = new Map();
     for (const p of g.plates) xs.set(p, p.x);
-    for (const b of g.birds) xs.set(b, b.x);
-    return { ticks: g.ticks, claude: g.claude, cx: g.claude.x, cy: g.claude.y, cam: g.camera, camX: g.camX, xs, tunnel: g.tunnel };
+    const ys = new Map();
+    for (const c of g.creatures) {
+        xs.set(c, c.x);
+        ys.set(c, c.y);
+    }
+    if (g.fight) {
+        xs.set(g.fight.boss, g.fight.boss.x);
+        ys.set(g.fight.boss, g.fight.boss.y);
+        for (const s of g.fight.shots) xs.set(s, s.x);
+    }
+    return { ticks: g.ticks, claude: g.claude, cx: g.claude.x, cy: g.claude.y, cam: g.camera, camX: g.camX, xs, ys, tunnel: g.tunnel };
 }
 
 function tick() {
     if (held.length && !g.auto) input(g, held[held.length - 1]);
     prev = snapshot();
-    const before = { on: g.claude.on, rope: g.claude.rope, vy: g.claude.vy, bonus: g.bonus, phase: g.phase, stage: g.stage, tunnel: g.tunnel };
+    const f = g.fight;
+    const before = { on: g.claude.on, rope: g.claude.rope, vy: g.claude.vy, bonus: g.bonus, phase: g.phase, stage: g.stage, tunnel: g.tunnel, fight: !!f, shots: f?.shots.length ?? 0, hp: f?.boss.hp ?? 0, hearts: f?.hearts ?? 0, dying: f?.boss.dying ?? 0 };
     autopilot(g);
     step(g);
     events(before);
     weatherTicks += 1;
-    sky = skyNow(weatherTicks);
+    sky = g.sky;
     weatherSounds();
     if (g.phase === "over") saveBest();
     for (const p of particles) {
@@ -417,8 +469,10 @@ function drawFar() {
 // a skyline far off along the bottom, in the place's own shapes: web towers with aerials, BIOS chips with pins, dark
 // spires, cloud server racks, mainframe cabinets, and graphics cards with cooling fins
 const SKYLINE = ["aerial", "pins", "spire", "puff", "stripes", "fins"];
+// which of those each world has, by name; the rest take turns
+const SKYLINE_OF = { WWW: "aerial", BIOS: "pins", "Dark Web": "spire", "AWS Cloud": "puff", IBM: "stripes", Nvidia: "fins", GitHub: "aerial", GitLab: "spire", Git: "pins" };
 function drawSkyline(theme, placeIndex) {
-    const style = SKYLINE[mod(placeIndex, SKYLINE.length)];
+    const style = SKYLINE_OF[theme.name] ?? SKYLINE[mod(placeIndex, SKYLINE.length)];
     const look = theme.look;
     const shift = camX * CW * 0.35;
     const base = VH;
@@ -957,7 +1011,7 @@ function drawWeatherFront(t) {
         const n = Math.round(140 * a);
         for (let i = 0; i < n; i++) {
             const speed = 9 + spot(i, 13) * 9;
-            const x = mod(spot(i, 14) * (VW + 80) * 2 + t * speed, VW + 80) - 40;
+            const x = mod(spot(i, 14) * (VW + 80) * 2 + t * speed * (sky.wind ?? 1), VW + 80) - 40;
             const y = HUD + spot(i, 15) * (VH - HUD) + Math.sin(t / 5 + i) * 3;
             const long = i % 4 === 0;
             rect(x, y, long ? 9 : 2, 1, long ? "rgba(235,190,120,0.55)" : "rgba(210,160,90,0.8)");
@@ -1033,6 +1087,534 @@ function drawWeatherFront(t) {
     }
 }
 
+// each world's creature as 12 x 8 pixel art drawn twice the size, so three cells wide: two frames, facing right, with
+// its own colours. k is the outline and w an eye's white in every one of them
+const CREATURE_ART = {
+    snake: {
+        colors: { b: "#3b78c4", y: "#ffd84a", w: "#ffffff" },
+        frames: [
+            ["........kkk.", ".......kbbbk", ".......kbwbk", "........kbbk", "..kkkk..kbk.", ".kyyyyk.kbk.", "kyykkyykbbk.", "kkk..kkkkk.."],
+            ["........kkk.", ".......kbbbk", ".......kbwbk", "........kbbk", "kk....kkkbk.", "kyk..kyyybk.", ".kykkyykkbk.", "..kkkk...kk."],
+        ],
+    },
+    nan: {
+        colors: { y: "#f7df1e", w: "#ffffff" },
+        frames: [
+            ["...kkkkkk...", "..kyyyyyyk..", ".kyykyykyyk.", ".kyykyykyyk.", ".kyyyyyyyyk.", ".kyykkkkyyk.", ".kyyyyyyyyk.", ".kykykykyk.."],
+            ["...kkkkkk...", "..kyyyyyyk..", ".kyykyykyyk.", ".kyykyykyyk.", ".kyyyyyyyyk.", ".kyyykkyyyk.", ".kyyyyyyyyk.", "..kykykykyk."],
+        ],
+    },
+    pointer: {
+        colors: { b: "#659ad2", w: "#ffffff" },
+        frames: [
+            ["....kkkk....", "...kbbbbk...", "...kbwbbk...", "...kbbbbk...", "....kbbk....", "..kkkbbkkk..", "...kbbbbk...", "....kkkk...."],
+            ["....kkkk....", "...kbbbbk...", "...kbbwbk...", "...kbbbbk...", "....kbbk....", "..kkkbbkkk..", "...kbbbbk...", "....kkkk...."],
+        ],
+    },
+    elephant: {
+        colors: { p: "#8892bf", w: "#ffffff" },
+        frames: [
+            ["..kkkkkk....", ".kppppppkk..", "kppppppppkk.", "kpppppppwpk.", "kppppppppppk", ".kppppppkkpk", ".kpkkpk...pk", ".kk..kk...k."],
+            ["..kkkkkk....", ".kppppppkk..", "kppppppppkk.", "kpppppppwpk.", "kppppppppppk", ".kppppppkkpk", "..kpkkpk..pk", "..kk..kk.kk."],
+        ],
+    },
+    bean: {
+        colors: { c: "#7a4a2a", d: "#3a2010", w: "#ffffff" },
+        frames: [
+            ["....kkkk....", "..kkcccckk..", ".kcccdcccck.", "kcwkccdwkcck", "kcccccdcccck", ".kcccccdcck.", "..kkcccckk..", "....kkkk...."],
+            ["....kkkk....", "..kkcccckk..", ".kcccdcccck.", "kckkccdkkcck", "kcccccdcccck", ".kcccccdcck.", "..kkcccckk..", "....kkkk...."],
+        ],
+    },
+    crab: {
+        colors: { r: "#ce422b", w: "#ffffff" },
+        frames: [
+            ["kk........kk", "krk......krk", ".kk.kkkk.kk.", "..kkrrrrkk..", ".krrwrrwrrk.", "krrrrrrrrrrk", ".kkkkkkkkkk.", ".k.k.kk.k.k."],
+            [".kk......kk.", "krrk....krrk", ".kk.kkkk.kk.", "..kkrrrrkk..", ".krrwrrwrrk.", "krrrrrrrrrrk", ".kkkkkkkkkk.", "k.k..kk..k.k"],
+        ],
+    },
+    gopher: {
+        colors: { g: "#00add8", w: "#ffffff" },
+        frames: [
+            [".kk......kk.", ".kgkkkkkkgk.", "kggggggggggk", "kgwkggggwkgk", "kggggkkggggk", "kggggwwggggk", ".kggggggggk.", "..kkk..kkk.."],
+            [".kk......kk.", ".kgkkkkkkgk.", "kggggggggggk", "kgkkggggkkgk", "kggggkkggggk", "kggggwwggggk", ".kggggggggk.", "..kkk..kkk.."],
+        ],
+    },
+    gem: {
+        colors: { r: "#cc342d", l: "#ff9a94", w: "#e8f4ff" },
+        frames: [
+            ["ww........ww", "www.kkkk.www", ".wwkrlrrkww.", "..krrrrrrk..", "...krrrrk...", "....krrk....", ".....kk.....", "............"],
+            ["............", "....kkkk....", "wwwkrlrrkwww", "wwkrrrrrrkww", "...krrrrk...", "....krrk....", ".....kk.....", "............"],
+        ],
+    },
+    spider: {
+        colors: { s: "#3a3f58", w: "#ff5a5a" },
+        frames: [
+            ["............", "k...kkkk...k", ".k.kssssk.k.", "..kswsswsk..", "kkkssssssskk", "..kssssssk..", ".k..kkkk..k.", "k..........k"],
+            ["............", ".k..kkkk..k.", "k..kssssk..k", "..kswsswsk..", ".kkssssssskk", "k.kssssssk.k", "...kkkkkk...", "..k......k.."],
+        ],
+    },
+    phantom: {
+        colors: { p: "#7b3fd0", r: "#ff3b6b" },
+        frames: [
+            ["....kkkk....", "...kppppk...", "..kpkkkkpk..", "..kkrkkrkk..", "..kpkkkkpk..", ".kppppppppk.", "kppppppppppk", "kpk.kpk.kpk."],
+            ["....kkkk....", "...kppppk...", "..kpkkkkpk..", "..kkrkkrkk..", "..kpkkkkpk..", ".kppppppppk.", "kppppppppppk", ".kpk.kpk.kpk"],
+        ],
+    },
+    storm: {
+        colors: { c: "#9aa3b5", o: "#ff9900", w: "#ffffff" },
+        frames: [
+            ["...kkk......", "..kccckkk...", ".kcccccccck.", "kccwcccwccck", "kcccccccccck", ".kkkkkkkkkk.", "....oo......", "...oo......."],
+            ["......kkk...", "...kkkccck..", ".kcccccccck.", "kccwcccwccck", "kcccccccccck", ".kkkkkkkkkk.", "............", "............"],
+        ],
+    },
+    reel: {
+        colors: { b: "#1f70c1", w: "#ffffff" },
+        frames: [
+            ["kkkkkkkkkkkk", "kbbbbbbbbbbk", "kbkkkbbkkkbk", "kbkwkbbkwkbk", "kbkkkbbkkkbk", "kbbbbbbbbbbk", "kkkkkkkkkkkk", ".kk......kk."],
+            ["kkkkkkkkkkkk", "kbbbbbbbbbbk", "kbkwkbbkwkbk", "kbkkkbbkkkbk", "kbkkkbbkkkbk", "kbbbbbbbbbbk", "kkkkkkkkkkkk", "..kk....kk.."],
+        ],
+    },
+    chip: {
+        colors: { g: "#76b900", o: "#ff7a1a", w: "#ffffff" },
+        frames: [
+            [".o...o...o..", "..o...o...o.", ".k.k.k.k.k..", "kkkkkkkkkkkk", "kgwkggggwkgk", "kggggggggggk", "kkkkkkkkkkkk", ".k.k.k.k.k.k"],
+            ["..o...o...o.", ".o...o...o..", ".k.k.k.k.k..", "kkkkkkkkkkkk", "kgwkggggwkgk", "kgggkkkggggk", "kkkkkkkkkkkk", ".k.k.k.k.k.k"],
+        ],
+    },
+    conflict: {
+        colors: { r: "#f05033", g: "#3fcf52", w: "#ffffff" },
+        frames: [
+            ["....kkkk....", "..kkrrggkk..", ".krrrrggggk.", "krwkrrggwkgk", "krrrrrgggggk", "krrrkkkkgggk", ".krrrrggggk.", "..kkkkkkkk.."],
+            ["............", "....kkkk....", "..kkrrggkk..", ".krwkrrgwkgk", "krrrrrgggggk", "krrrkkkkgggk", "krrrrrgggggk", ".kkkkkkkkkk."],
+        ],
+    },
+    drone: {
+        colors: { d: "#4a4f5a", w: "#7ee0ff" },
+        frames: [
+            ["kkkk....kkkk", "...k....k...", "..kkkkkkkk..", ".kddddddddk.", ".kdwkddwkdk.", ".kddddddddk.", "..kkkkkkkk..", "...k....k..."],
+            [".kk......kk.", "...k....k...", "..kkkkkkkk..", ".kddddddddk.", ".kdwkddwkdk.", ".kddddddddk.", "..kkkkkkkk..", "....k..k...."],
+        ],
+    },
+    worm: {
+        colors: { o: "#fc6d26", w: "#ffffff" },
+        frames: [
+            ["............", ".........kk.", "........kook", ".kk..kk.kowk", "kook.kookook", "kookkookkook", ".kk..kk..kk.", "............"],
+            ["............", ".........kk.", ".kk.....kook", "kook.kk.kowk", "kookkookkook", ".kk.kookkook", ".....kk...kk", "............"],
+        ],
+    },
+};
+
+function drawArt(rows, colors, x, y, flip) {
+    rows.forEach((row, r) => {
+        [...row].forEach((ch, c) => {
+            if (ch === ".") return;
+            const col = flip ? row.length - 1 - c : c;
+            rect(x + col * 2, y + r * 2, 2, 2, ch === "k" ? INK : colors[ch]);
+        });
+    });
+}
+
+// a creature where it is: its own art, facing the way it goes, and a dropper's thread up to where it hangs from
+function drawCreature(c, at, atY) {
+    const x = px(at);
+    if (x < -24 || x > VW + 8) return;
+    const art = CREATURE_ART[c.kind];
+    if (!art) return drawBug({ ...c, y: atY }, at);
+    const bottom = rowTop(atY) + CH;
+    if (c.style === "drop") rect(x + 12, rowTop(c.top + 2), 1, bottom - 16 - rowTop(c.top + 2), "rgba(220,225,240,0.6)");
+    // a swooper diving leaves a streak behind it
+    if (c.style === "swoop" && c.phase === "dive") {
+        for (let k = 1; k <= 3; k++) rect(x + 12 - c.dir * k * 6, bottom - 10 + k * 2, 4, 2, `rgba(255,255,255,${0.3 - k * 0.08})`);
+    }
+    const frameNo = mod((frame >> 3) + (c.t >> 2), 2);
+    drawArt(art.frames[frameNo], art.colors, x, bottom - 16, c.dir < 0);
+}
+
+// ---- meteors, lava bombs and fires ----
+
+// a strike's target: a blinking ring on the platform where it will land, and the thing itself coming down on it
+function drawStrike(s) {
+    const cx = px(s.x + 1.5);
+    const feet = py(s.y);
+    const blink = mod(frame >> 3, 2);
+    const ring = s.kind === "meteor" ? "#ff4a4a" : "#ff8a1a";
+    // a faint column marks the spot from above, so it can be seen coming from anywhere on screen
+    rect(cx - 12, HUD, 24, feet - HUD, `rgba(255,80,40,${blink ? 0.1 : 0.05})`);
+    rect(cx - 14, feet - 2, 28, 2, blink ? ring : "#ffe0a0");
+    rect(cx - 14, feet - 6, 2, 4, ring);
+    rect(cx + 12, feet - 6, 2, 4, ring);
+    for (let k = 0; k < 3; k++) {
+        rect(cx - 5 + k * 2, feet - 12 + k * 2, 2, 2, ring);
+        rect(cx + 3 - k * 2, feet - 12 + k * 2, 2, 2, ring);
+    }
+    const high = s.t * 0.6;
+    const fx = px(s.x + 1.5 + s.from * s.t * 0.4);
+    const fy = py(s.y + high);
+    if (fy < HUD - 20) return;
+    if (s.kind === "meteor") {
+        for (let tail = 1; tail < 8; tail++) rect(fx + s.from * tail * 5 - 2, fy - 8 - tail * 7, 5 - tail * 0.5, 5 - tail * 0.5, `rgba(255,${200 - tail * 18},80,${1 - tail / 8})`);
+        rect(fx - 5, fy - 12, 10, 10, INK);
+        rect(fx - 4, fy - 11, 8, 8, "#7a6450");
+        rect(fx - 3, fy - 10, 3, 3, "#b39a7d");
+        rect(fx + 1, fy - 6, 2, 2, "#4a3a2c");
+    } else {
+        for (let tail = 1; tail < 6; tail++) rect(fx + s.from * tail * 3 - 1, fy - 6 - tail * 6, 3, 3, `rgba(255,${140 - tail * 16},20,${1 - tail / 6})`);
+        rect(fx - 4, fy - 10, 8, 8, INK);
+        rect(fx - 3, fy - 9, 6, 6, mod(frame >> 2, 2) ? "#ff6a1a" : "#ffb347");
+        rect(fx - 2, fy - 8, 2, 2, "#fff0a0");
+    }
+}
+
+// where a strike landed: a burst of light and rubble, gone in a moment
+function drawImpact(i) {
+    const cx = px(i.x + 1.5);
+    const feet = py(i.y);
+    const k = 12 - i.t;
+    const r = 6 + k * 3;
+    const glow = i.kind === "meteor" ? "255,230,160" : "255,140,40";
+    rect(cx - r, feet - r / 2, r * 2, r / 2, `rgba(${glow},${0.6 - k * 0.05})`);
+    for (let n = 0; n < 8; n++) {
+        const ang = (n / 8) * Math.PI;
+        rect(cx + Math.cos(ang) * r, feet - Math.sin(ang) * r * 0.8, 3, 3, i.kind === "meteor" ? "#8a7360" : "#ff7a1a");
+    }
+}
+
+// a platform on fire: smoke curling up off it first, then flames all along the part that burns
+function drawFire(p, at) {
+    const x0 = px(at);
+    const y = rowTop(p.y);
+    if (y > VH || y < HUD - CH * 3) return;
+    const { from, to, smoke } = p.fire;
+    for (let i = from; i <= to; i++) {
+        const cx = x0 + i * CW + 4;
+        if (smoke > 0) {
+            // the smoke thickens as it gets closer to catching
+            const thick = 1 - smoke / 40;
+            const rise = mod(frame / 2 + hash(p.n * 7 + i) * 24, 24);
+            if (hash(p.n * 13 + i) < 0.4 + thick * 0.6) rect(cx - 2 + Math.sin(rise / 4) * 2, y - 4 - rise, 4 + rise / 6, 3, `rgba(90,85,85,${(0.25 + thick * 0.4) * (1 - rise / 24)})`);
+            if (thick > 0.5 && mod(frame + i * 5, 12) < 3) rect(cx - 1, y - 2, 2, 2, "#ff8a1a");
+            continue;
+        }
+        const h = 8 + Math.abs(Math.sin(frame / 5 + i * 1.3)) * 10 + hash(i + (frame >> 2)) * 4;
+        rect(cx - 4, y - h, 8, h, "rgba(255,90,20,0.85)");
+        rect(cx - 2, y - h * 0.7, 4, h * 0.7, "#ffb347");
+        rect(cx - 1, y - h * 0.35, 2, h * 0.35, "#fff0a0");
+    }
+    if (smoke === 0) rect(x0 + from * CW, y, (to - from + 1) * CW, CH, "rgba(60,20,10,0.45)");
+}
+
+// ---- boss fights ----
+
+// the mini bosses are their world's creature, six times the size; the bug has no art of its own (it's drawn by hand
+// in the tunnels), so its giant gets some
+const BOSS_BUG = {
+    colors: { w: "#d8f6ff", l: "#7cf08a", g: "#3fcf52", d: "#1f7a2c", e: "#ffffff" },
+    frames: [
+        ["..ww..ww....", ".wwww.wwww..", "..kkkkkkk...", ".klllllllkkk", "kgggggggkgek", "kgdggdggkggk", ".kkkkkkkkkk.", "..k.k.k.k..."],
+        ["............", "wwww..wwww..", "..kkkkkkk...", ".klllllllkkk", "kgggggggkgek", "kgdggdggkggk", ".kkkkkkkkkk.", ".k.k.k.k...."],
+    ],
+};
+
+// a boss is drawn on a canvas of its own first, so a hit can flash just its shape white
+const bossCanvas = document.createElement("canvas");
+bossCanvas.width = 120;
+bossCanvas.height = 84;
+const BOSS_PAD = 12;
+function onBossCanvas(draw) {
+    const keep = ctx;
+    ctx = bossCanvas.getContext("2d");
+    ctx.clearRect(0, 0, bossCanvas.width, bossCanvas.height);
+    try {
+        draw();
+    } finally {
+        ctx = keep;
+    }
+}
+
+function drawArtBig(rows, colors, x, y, flip, size) {
+    rows.forEach((row, r) => {
+        [...row].forEach((ch, c) => {
+            if (ch === ".") return;
+            const col = flip ? row.length - 1 - c : c;
+            rect(x + col * size, y + r * size, size, size, ch === "k" ? INK : colors[ch]);
+        });
+    });
+}
+
+// eyes that look at Claude: a white, and a pupil on the side Claude is on
+function bossEyes(xs, y, look, size = 6, white = "#ffffff", pupil = INK) {
+    for (const x of xs) {
+        rect(x - 1, y - 1, size + 2, size + 2, INK);
+        rect(x, y, size, size, white);
+        rect(x + (look > 0 ? size - 3 : 0), y + 2, 3, 3, pupil);
+    }
+}
+
+// the five big bosses, each by hand, in a box w by h pixels with its feet at the bottom
+const BIG_ART = {
+    // a monitor with the sad face of a crashed computer, on a stand
+    bluescreen(w, h, b, look) {
+        rect(w / 2 - 8, h - 10, 16, 6, INK);
+        rect(w / 2 - 7, h - 10, 14, 5, "#8a8a96");
+        rect(w / 2 - 24, h - 5, 48, 5, INK);
+        rect(w / 2 - 23, h - 4, 46, 3, "#a8a8b4");
+        rect(0, 0, w, h - 10, INK);
+        rect(1, 1, w - 2, h - 12, "#c8c8d2");
+        rect(1, h - 13, w - 2, 2, "#9a9aa6");
+        const flicker = b.windup > 0 && mod(frame >> 2, 2);
+        rect(6, 5, w - 12, h - 22, flicker ? "#4a7cff" : "#1f4fd8");
+        text(":(", 12, 10, "#ffffff", 16);
+        for (let i = 0; i < 4; i++) rect(12, 32 + i * 4, 20 + ((i * 37 + (frame >> 4)) % 50), 2, "rgba(255,255,255,0.75)");
+        bossEyes([w - 40, w - 24], 12, look, 7, "#ffffff", "#1f4fd8");
+        rect(w - 10, h - 15, 3, 2, mod(frame >> 3, 2) ? "#7cf08a" : "#2a6a34");
+    },
+    // a wobbling stack of orange and grey frames, one pushed on top of another
+    stack(w, h, b, look) {
+        const slabs = 5;
+        const sh = Math.floor(h / slabs);
+        for (let i = 0; i < slabs; i++) {
+            const sw = w - 8 - i * 6;
+            const sway = Math.round(Math.sin(frame / 14 + i * 0.9) * (1 + i * 0.8));
+            const x = (w - sw) / 2 + sway;
+            const y = h - (i + 1) * sh;
+            rect(x - 1, y, sw + 2, sh, INK);
+            rect(x, y + 1, sw, sh - 2, i % 2 ? "#bcbbbb" : "#f48024");
+            rect(x, y + 1, sw, 1, i % 2 ? "#e4e4e4" : "#ffb070");
+            if (i < slabs - 1) text(`0x${(i * 4 + 0x7f0).toString(16)}`, x + 4, y + 2, i % 2 ? "#5a5a5a" : "#7a3200");
+        }
+        const topY = h - slabs * sh;
+        bossEyes([w / 2 - 14, w / 2 + 4], topY + 2, look, 6);
+    },
+    // a red beetle with a clock on its back stuck between 99 and 00
+    y2k(w, h, b, look) {
+        const legY = h - 8;
+        for (let i = 0; i < 4; i++) {
+            const lx = 14 + i * 20;
+            const lift = mod((frame >> 3) + i, 2) * 2;
+            rect(lx, legY - lift, 4, 8 + lift, INK);
+        }
+        rect(4, 10, w - 18, h - 18, INK);
+        rect(5, 11, w - 20, h - 20, "#d8343c");
+        rect(5, 11, w - 20, 3, "#ff6a6a");
+        rect(w / 2 - 6, 11, 2, h - 20, "#8a1a20");
+        rect(14, 18, 34, 16, INK);
+        rect(15, 19, 32, 14, "#1a2a1a");
+        text(mod(frame >> 5, 2) ? "00" : "99", 16, 21, "#7cff8a", 16);
+        rect(w - 18, 18, 16, 22, INK);
+        rect(w - 17, 19, 14, 20, "#a8242c");
+        bossEyes([w - 14], 22, 1, 6, "#ffe0a0", INK);
+        rect(w - 8, 4, 2, 14, INK);
+        rect(w - 4, 2, 2, 14, INK);
+    },
+    // a black screen that has given up: red text, and sparks coming off it
+    panic(w, h, b, look) {
+        const hot = b.windup > 0 || mod(frame >> 3, 2);
+        rect(4, 0, w - 8, h - 4, hot ? "#ff3a3a" : "#8a1a1a");
+        rect(6, 2, w - 12, h - 8, "#0a0a0a");
+        text("KERNEL", 14, 8, "#ff4a4a");
+        text("PANIC", 18, 20, hot ? "#ffffff" : "#ff4a4a");
+        rect(14, 32, 20, 2, "#ff4a4a");
+        for (let i = 0; i < 3; i++) rect(14, 36 + i * 4, 40 + ((i * 29 + (frame >> 3)) % 20), 2, "rgba(255,80,80,0.6)");
+        bossEyes([w - 32, w - 18], 34, look, 6, "#ff4a4a", "#ffffff");
+        for (let i = 0; i < 4; i++) {
+            if (hash(i * 31 + (frame >> 2)) < 0.5) continue;
+            rect(hash(i * 13 + (frame >> 2)) * w, hash(i * 17 + (frame >> 2)) * h, 2, 2, "#ffd84a");
+        }
+    },
+    // an ancient mainframe in grey stone, its tape reels still turning
+    monolith(w, h, b, look) {
+        rect(0, 0, w, h, INK);
+        rect(1, 1, w - 2, h - 2, "#5a5a66");
+        rect(1, 1, w - 2, 2, "#8a8a96");
+        rect(1, h - 4, w - 2, 3, "#3a3a44");
+        for (const cx of [20, w - 20]) {
+            rect(cx - 10, 8, 20, 20, INK);
+            rect(cx - 9, 9, 18, 18, "#2a2a32");
+            rect(cx - 3, 15, 6, 6, "#8a8a96");
+            const turn = (frame / 10 + cx) % (Math.PI * 2);
+            for (let k = 0; k < 3; k++) {
+                const a = turn + (k * Math.PI * 2) / 3;
+                rect(cx + Math.cos(a) * 6 - 1, 18 + Math.sin(a) * 6 - 1, 3, 3, "#c8c8d2");
+            }
+        }
+        for (let i = 0; i < 10; i++) rect(10 + i * 8, 34, 4, 3, hash(i * 7 + (frame >> 4)) < 0.5 ? "#ffd84a" : "#4a4a20");
+        text("COBOL", w / 2 - 20, 42, "#3a3a44");
+        // the cracks spread as it weakens
+        const cracks = Math.floor((1 - b.hp / b.maxHp) * 4);
+        for (let i = 0; i < cracks; i++) for (let k = 0; k < 6; k++) rect(12 + i * 22 + (k % 2) * 2, 4 + k * 3, 1, 3, INK);
+        bossEyes([w / 2 - 12, w / 2 + 4], 12, look, 6, "#ffd84a", INK);
+    },
+};
+
+function drawBoss(f, bx, by) {
+    const b = f.boss;
+    const w = b.w * CW;
+    const h = b.h * CH;
+    const look = drawnCx + 2.5 > b.x + b.w / 2 ? 1 : -1;
+    onBossCanvas(() => {
+        if (b.big) {
+            ctx.save();
+            ctx.translate(BOSS_PAD, BOSS_PAD);
+            BIG_ART[b.kind](w, h, b, look);
+            ctx.restore();
+            return;
+        }
+        const art = b.kind === "bug" ? BOSS_BUG : CREATURE_ART[b.kind];
+        const frameNo = mod((frame >> 3) + (b.act === "idle" ? 0 : frame >> 2), 2);
+        drawArtBig(art.frames[frameNo], art.colors, BOSS_PAD, BOSS_PAD, b.dir < 0, 6);
+    });
+    const bctx = bossCanvas.getContext("2d");
+    // hit: its shape flashes white; beaten: it blinks out
+    if (b.flash > 0 || (b.dying && mod(frame >> 2, 2))) {
+        bctx.globalCompositeOperation = "source-atop";
+        bctx.fillStyle = "rgba(255,255,255,0.8)";
+        bctx.fillRect(0, 0, bossCanvas.width, bossCanvas.height);
+        bctx.globalCompositeOperation = "source-over";
+    }
+    // winding up: it shakes, and a red ! shows over it
+    const shakeX = b.windup > 0 ? (mod(frame >> 1, 2) ? 1 : -1) : 0;
+    const x = px(bx) + shakeX;
+    const top = py(by + b.h);
+    if (b.dying) ctx.globalAlpha = Math.max(0.2, b.dying / 36);
+    // a dropper hangs on a thread
+    if (b.style === "drop") rect(x + w / 2, HUD, 2, Math.max(0, top - HUD), "rgba(220,225,240,0.6)");
+    ctx.drawImage(bossCanvas, x - BOSS_PAD, top - BOSS_PAD);
+    ctx.globalAlpha = 1;
+    if (b.windup > 0 && blinkOn()) outlinedAt("!", x + w / 2 - 4, top - 14, "#ff4a4a");
+    // where a charge, a leap, a dive or a drop is about to land
+    if (b.windup > 0 && b.target) {
+        const tx = px(b.target.x);
+        const feet = py(f.floor + 1);
+        const mark = mod(frame >> 3, 2) ? "#ff4a4a" : "#ffe0a0";
+        if (b.act === "charge") {
+            for (let k = 0; k < 4; k++) arrowAt(x + w / 2 + b.dir * (w / 2 + 6 + k * 14), feet - 10, b.dir, mark);
+        } else {
+            rect(tx, feet - 2, w, 2, mark);
+            rect(tx, feet - 6, 2, 4, mark);
+            rect(tx + w - 2, feet - 6, 2, 4, mark);
+        }
+    }
+}
+
+const outlinedAt = (s, x, y, color, size = 8) => {
+    for (const [dx, dy] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) text(s, x + dx, y + dy, INK, size);
+    text(s, x, y, color, size);
+};
+function arrowAt(x, y, dir, color) {
+    for (let k = 0; k < 4; k++) rect(x + (dir > 0 ? k * 2 : -k * 2), y + k, 2, 8 - k * 2, color);
+}
+
+// the walls that close the arena: glowing bars at both ends
+function drawWalls(f) {
+    const top = py(f.floor + 18);
+    const bottom = py(f.floor);
+    const glow = 0.5 + 0.3 * Math.sin(frame / 10);
+    for (const x of [px(f.x0) - 2, px(f.x1) - 2]) {
+        rect(x, top, 4, bottom - top, `rgba(255,90,60,${glow})`);
+        rect(x + 1, top, 2, bottom - top, "#ffd0b0");
+        for (let y = top + mod(frame, 16); y < bottom; y += 16) rect(x - 1, y, 6, 2, "#ff5a3a");
+    }
+}
+
+// an attack: while it's warning, only a mark where it will be; then the thing itself
+function drawAttack(a, f) {
+    const x = px(a.x);
+    const w = a.w * CW;
+    const feet = py(f.floor + 1);
+    const blink = mod(frame >> 3, 2);
+    const mark = blink ? "#ff4a4a" : "#ffe0a0";
+    if (a.warn > 0) {
+        if (a.kind === "fall" || a.kind === "bomb") {
+            rect(x, HUD, w, feet - HUD, `rgba(255,80,40,${blink ? 0.12 : 0.06})`);
+            rect(x - 2, feet - 2, w + 4, 2, mark);
+            rect(x - 2, feet - 6, 2, 4, mark);
+            rect(x + w, feet - 6, 2, 4, mark);
+        } else if (a.kind === "bolt") {
+            rect(x, py(a.y + a.h), w, a.h * CH, `rgba(255,60,60,${blink ? 0.28 : 0.14})`);
+        } else if (a.kind === "row" || a.kind === "slide") {
+            // a flashing sign at the wall it will come through, at its height
+            const fromLeft = a.vx > 0;
+            const ex = fromLeft ? px(f.x0) + 4 : px(f.x1) - 14;
+            if (a.warn < 40 || blink) outlinedAt("!", ex, py(a.y + a.h) + 2, mark);
+            arrowAt(fromLeft ? ex + 12 : ex - 6, py(a.y) - 9, fromLeft ? 1 : -1, mark);
+        }
+        if (a.kind === "bomb") {
+            // the bomb on its way over, landing as its fuse runs out
+            const k = 1 - a.warn / a.fuse;
+            const bx = a.fromX + (a.x + a.w / 2 - a.fromX) * k;
+            const by = a.fromY + (a.y - a.fromY) * k + 10 * Math.sin(Math.PI * k);
+            rect(px(bx) - 5, py(by) - 10, 10, 10, INK);
+            rect(px(bx) - 4, py(by) - 9, 8, 8, "#3a3a44");
+            rect(px(bx) + 1, py(by) - 13, 2, 4, blink ? "#ffd84a" : "#ff6a1a");
+        }
+        return;
+    }
+    const top = py(a.y + a.h);
+    const h = a.h * CH;
+    if (a.kind === "fall" && !a.block) {
+        rect(x + 2, top - 6, w - 4, 6, "rgba(255,120,80,0.35)");
+        rect(x + 3, top, w - 6, h, INK);
+        rect(x + 4, top + 1, w - 8, h - 2, "#ff5a3a");
+        rect(x + 5, top + 2, 3, 3, "#ffd0a0");
+    } else if (a.kind === "fall" || a.kind === "slide") {
+        rect(x, top, w, h, INK);
+        rect(x + 1, top + 1, w - 2, h / 2 - 1, "#f48024");
+        rect(x + 1, top + h / 2, w - 2, h / 2 - 1, "#bcbbbb");
+        rect(x + 1, top + 1, w - 2, 1, "#ffb070");
+        if (a.kind === "slide") arrowAt(a.vx > 0 ? x + w - 8 : x + 6, top + h / 2 - 4, Math.sign(a.vx), INK);
+    } else if (a.kind === "row") {
+        rect(x, top, w, h, INK);
+        rect(x + 1, top + 1, w - 2, h - 2, "#c8202a");
+        text("ERROR", x + 1, top + 2, blink ? "#ffffff" : "#ffd0d0");
+    } else if (a.kind === "wave") {
+        for (let k = 0; k < 3; k++) rect(x + k * 4, top + 8 - k * 4, w - k * 8 + 4, 4 + k * 4, `rgba(255,${230 - k * 40},120,${0.9 - k * 0.25})`);
+    } else if (a.kind === "bolt") {
+        for (let y = top; y < top + h; y += 8) {
+            const zig = (Math.floor((y - top) / 8) + (frame >> 1)) % 2 ? 4 : -4;
+            rect(x + w / 2 - 3 + zig, y, 6, 8, "#fff6c0");
+            rect(x + w / 2 - 1 + zig, y, 2, 8, "#ffffff");
+        }
+        rect(x - 4, feet - 4, w + 8, 4, "rgba(255,240,160,0.8)");
+    } else if (a.kind === "bomb") {
+        const r = a.w * CW * 0.5;
+        const cx = x + w / 2;
+        rect(cx - r, top, r * 2, h, `rgba(255,140,40,${0.4 + 0.2 * blink})`);
+        rect(cx - r * 0.6, top + h * 0.3, r * 1.2, h * 0.7, "#ffb347");
+        rect(cx - r * 0.25, top + h * 0.5, r * 0.5, h * 0.5, "#fff0a0");
+    }
+}
+
+// a mini fireball: a hot core, and a tail behind it
+function drawShot(s, sx) {
+    const x = px(sx);
+    const y = py(s.y) - 3;
+    for (let k = 1; k <= 3; k++) rect(x - s.dir * k * 4 - 1, y + 1, 4 - k + 1, 4 - k + 1, `rgba(255,${180 - k * 30},40,${0.7 - k * 0.18})`);
+    rect(x - 3, y - 1, 7, 7, INK);
+    rect(x - 2, y, 5, 5, "#ff7a1a");
+    rect(x - 1, y + 1, 3, 3, "#ffe08a");
+}
+
+function drawHeart(x, y, full) {
+    const rows = [".kk.kk.", "kffkffk", "kfffffk", ".kfffk.", "..kfk..", "...k..."];
+    rows.forEach((row, r) =>
+        [...row].forEach((ch, c) => {
+            if (ch !== ".") rect(x + c * 2, y + r * 2, 2, 2, ch === "k" ? INK : full ? "#ff4a5a" : "#3a2a34");
+        }),
+    );
+}
+
+// the boss's name and health along the top of the arena
+function drawBossBar(f) {
+    const b = f.boss;
+    const barW = 200;
+    const x = (VW - barW) / 2;
+    const y = HUD + 6;
+    centered(`${b.big ? "" : "MINI "}BOSS: ${b.name.toUpperCase()}`, y, b.big ? "#ff8a8a" : "#ffd84a");
+    rect(x - 1, y + 11, barW + 2, 6, INK);
+    rect(x, y + 12, barW, 4, "#2a1a24");
+    rect(x, y + 12, Math.max(0, (barW * b.hp) / b.maxHp), 4, b.hp / b.maxHp > 0.33 ? "#ff4a5a" : "#ffd84a");
+}
+
 // ---- the score bar and the screens over the world ----
 
 function drawHud() {
@@ -1040,7 +1622,17 @@ function drawHud() {
     const best = g.assisted ? record : Math.max(record, scoreOf(g));
     rect(0, 0, VW, HUD, INK);
     rect(0, HUD - 2, VW, 2, theme.look.plate);
-    text(theme.name.toUpperCase(), 4, 4, theme.look.light);
+    const lap = lapOf(g.stage - 1);
+    let left = 4;
+    if (g.fight) {
+        for (let i = 0; i < 3; i++) drawHeart(4 + i * 16, 2, i < g.fight.hearts);
+        left = 54;
+    } else {
+        text(theme.name.toUpperCase(), 4, 4, theme.look.light);
+        ctx.font = `8px ${FONT}`;
+        left = 12 + ctx.measureText(theme.name.toUpperCase()).width;
+    }
+    if (lap > 1) text(`L${lap}`, left, 4, "#ffd84a");
     const right = `DIST ${g.best}  SCORE ${scoreOf(g)}  HI ${best}`;
     ctx.font = `8px ${FONT}`;
     text(right, VW - 4 - ctx.measureText(right).width, 4, "#f4f4f8");
@@ -1052,15 +1644,15 @@ const blinkOn = () => mod(frame >> 4, 2) === 0;
 function drawTitle() {
     dim();
     centered("SKY HOP", HUD + 14, "#ffffff", 24);
-    centered("RUN - CLIMB - SWING", HUD + 46, CLAUDE.body);
+    centered("17 WORLDS OF TECH", HUD + 46, CLAUDE.body);
     ctx.save();
     ctx.translate(VW / 2 - 40, HUD + 58);
     ctx.scale(2, 2);
     drawClaude(0, 24, { bob: mod(frame >> 5, 2), eyes: mod(frame, 200) < 8 ? "blink" : "open" });
     ctx.restore();
-    const lines = ["ARROWS / A D   MOVE", "SPACE  JUMP / LET GO", "W FLAP   S DROP / DOOR", "TAB  CLOCK   M  SOUND"];
-    lines.forEach((line, i) => centered(line, HUD + 122 + i * 14, "#c9c9de"));
-    if (blinkOn()) centered("PRESS SPACE", HUD + 200, "#ffd84a");
+    const lines = ["ARROWS / A D   MOVE", "SPACE  JUMP / LET GO", "W FLAP   S DROP / DOOR", "F  FIRE AT A BOSS", "TAB  CLOCK   M  SOUND"];
+    lines.forEach((line, i) => centered(line, HUD + 118 + i * 14, "#c9c9de"));
+    if (blinkOn()) centered("PRESS SPACE", HUD + 204, "#ffd84a");
 }
 
 function drawOver() {
@@ -1073,22 +1665,53 @@ function drawOver() {
     if (!g.auto && blinkOn()) centered("PRESS R TO TRY AGAIN", HUD + 172, "#c9c9de");
 }
 
+// what a dangerous disaster means, under its name
+const WARNINGS = {
+    "meteor shower": "KEEP OFF THE RED MARKS",
+    volcano: "LAVA LANDS ON THE MARKS, AND BURNS",
+    wildfire: "SMOKING PLATFORMS ARE ABOUT TO BURN",
+};
+
 function drawBanner() {
     if (g.phase !== "playing") return;
     const theme = themeNow();
+    const f = g.fight;
+    if (f) {
+        if (f.intro > 0) {
+            rect(0, HUD + 60, VW, 50, "rgba(7,7,13,0.6)");
+            outlined(f.boss.big ? "BOSS!" : "MINI BOSS!", HUD + 66, blinkOn() ? "#ff4a5a" : "#ffffff", 16);
+            outlined(f.boss.name.toUpperCase(), HUD + 88, "#ffd84a");
+            if (f.lap > 1) outlined(`LAP ${f.lap}: TOUGHER`, HUD + 100, "#c9c9de");
+        } else if (f.intro === 0 && f.boss.hp === f.boss.maxHp && blinkOn()) {
+            outlined("PRESS F TO FIRE", HUD + 200, "#ffffff");
+        }
+        drawBossBar(f);
+        return;
+    }
+    if (g.beaten) outlined(`${g.beaten.name.toUpperCase()} BEATEN! +${g.beaten.bonus}`, HUD + 80, blinkOn() ? "#ffd84a" : "#ffffff");
     if (g.banner > 0) {
         rect(0, HUD + 28, VW, 40, "rgba(7,7,13,0.6)");
         if (g.tunnel !== null) {
             centered(`${theme.name.toUpperCase()} TUNNEL!`, HUD + 34, blinkOn() ? theme.look.light : "#ffffff", 16);
             centered("GRAB THE STARS, FIND THE EXIT", HUD + 56, "#c9c9de");
         } else {
-            centered(`${theme.name.toUpperCase()} ZONE!`, HUD + 34, blinkOn() ? theme.look.light : "#ffffff", 16);
-            centered(`STAGE ${g.stage}: HARDER NOW`, HUD + 56, "#c9c9de");
+            const lap = lapOf(g.stage - 1);
+            // back at the first world: the next lap, and everything's tougher
+            const newLap = lap > 1 && (g.stage - 1) % 17 === 0;
+            centered(newLap ? `LAP ${lap}!` : `${theme.name.toUpperCase()} ZONE!`, HUD + 34, blinkOn() ? theme.look.light : "#ffffff", 16);
+            centered(newLap ? "THE BOSSES ARE TOUGHER" : `STAGE ${g.stage}: HARDER NOW`, HUD + 56, "#c9c9de");
         }
         return;
     }
-    // a disaster gets its name up for a few seconds as it starts
-    if (sky.disaster && sky.age < 70 && g.tunnel === null) outlined(`${sky.disaster.toUpperCase()}!`, HUD + 36, blinkOn() ? "#ff8a3a" : "#ffe0a0", 16);
+    if (g.tunnel !== null) return;
+    // a disaster gets its name up for a few seconds as it starts, and what it means for Claude when it's dangerous
+    if (sky.disaster && sky.age < 110) {
+        outlined(`${sky.disaster.toUpperCase()}!`, HUD + 36, blinkOn() ? "#ff8a3a" : "#ffe0a0", 16);
+        const warning = g.hazards && WARNINGS[sky.disaster];
+        if (warning) outlined(warning, HUD + 60, "#ffffff");
+        return;
+    }
+    if (g.hazards && sky.weather === "sandstorm" && sky.amount > 0.5 && sky.amount < 0.9) outlined(`SANDSTORM! WIND ${sky.wind > 0 ? ">>>" : "<<<"}`, HUD + 36, "#ffe0a0");
 }
 
 // Tab puts up the computer's own time over the game, and the autopilot keeps playing underneath it like a screensaver
@@ -1184,17 +1807,34 @@ function draw(alpha) {
     for (const d of g.doors) drawDoor(d);
     if (tunnel) drawExit(tunnel);
     for (const p of g.plates) drawPlate(p, xOf(p));
+    for (const p of g.plates) if (p.fire) drawFire(p, xOf(p));
     for (const r of g.ropes) drawRope(r);
     for (const s of g.stars) drawStar(s);
-    for (const b of g.birds) drawBug(b, xOf(b));
+    for (const c of g.creatures) {
+        const was = live ? prev.ys.get(c) : undefined;
+        drawCreature(c, xOf(c), was === undefined || Math.abs(c.y - was) > 4 ? c.y : lerp(was, c.y));
+    }
+    for (const s of g.strikes) drawStrike(s);
+    for (const i of g.impacts) drawImpact(i);
+    const fight = g.fight;
+    if (fight) {
+        drawWalls(fight);
+        for (const at of fight.attacks) if (at.warn > 0) drawAttack(at, fight);
+        const b = fight.boss;
+        const wasY = live ? prev.ys.get(b) : undefined;
+        drawBoss(fight, xOf(b), wasY === undefined || Math.abs(b.y - wasY) > 4 ? b.y : lerp(wasY, b.y));
+        for (const at of fight.attacks) if (at.warn === 0) drawAttack(at, fight);
+    }
 
     if (g.phase === "over") {
         // knocked out: Claude pops up and drops off the bottom of the screen
         const since = clock - deathAt;
         drawClaude(px(deathX), py(deathY) - 90 * since + 320 * since * since, { eyes: "dead", legs: 6 });
-    } else {
+    } else if (!(fight && fight.hurt > 0 && mod(frame >> 2, 2))) {
+        // just hit: Claude flashes while it can't be hit again
         drawClaude(px(drawnCx), py(drawnCy), claudePose());
     }
+    if (fight) for (const s of fight.shots) drawShot(s, xOf(s));
 
     for (const b of g.bolts) if (b.t <= BOLT_STRIKE) drawBolt(b);
     for (const p of particles) {

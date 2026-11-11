@@ -37,10 +37,11 @@ export function updateSky(g) {
     g.sky = g.holdSky ? holdSky(real, g.holdSky) : real;
 }
 
-const active = (g, disaster) => g.hazards && g.tunnel === null && g.sky.disaster === disaster && g.sky.power >= HAZARD_POWER;
+// and none of it in a boss fight, where the boss is the only danger
+const active = (g, disaster) => g.hazards && g.tunnel === null && !g.fight && g.sky.disaster === disaster && g.sky.power >= HAZARD_POWER;
 
 // the wind right now, from -1 to 1: which way and how hard
-export const windNow = (g) => (g.hazards && g.tunnel === null && g.sky.weather === "sandstorm" ? g.sky.wind * g.sky.amount : 0);
+export const windNow = (g) => (g.hazards && g.tunnel === null && !g.fight && g.sky.weather === "sandstorm" ? g.sky.wind * g.sky.amount : 0);
 export const windPush = (g, inAir) => windNow(g) * (inAir ? WIND_AIR : WIND_GROUND);
 export const windSwing = (g) => windNow(g) * WIND_SWING;
 
@@ -128,7 +129,7 @@ function patrol(c) {
 }
 
 // each moves its own way: fliers and walkers pace back and forth, hoppers hop as they go, droppers fall on Claude
-// passing under and climb back, swoopers dive at Claude and rise again
+// walking under and climb back, swoopers dive at Claude and rise again
 function moveCreatures(g) {
     const { claude } = g;
     const middle = claude.x + BODY_W / 2;
@@ -141,7 +142,8 @@ function moveCreatures(g) {
             const at = c.t % HOP_EVERY;
             c.y = c.ground + (at < HOP_TICKS ? HOP_HEIGHT * Math.sin((Math.PI * at) / HOP_TICKS) : 0);
         } else if (c.style === "drop") {
-            if (c.phase === "idle" && Math.abs(across) < 3.5 && claude.y < c.y && claude.y > c.floor - 4) c.phase = "drop";
+            // it drops on Claude walking underneath; Claude jumping past is gone before it could reach
+            if (c.phase === "idle" && claude.on && Math.abs(across) < 3.5 && claude.y < c.y && claude.y > c.floor - 4) c.phase = "drop";
             if (c.phase === "drop") {
                 c.y = Math.max(c.floor, c.y - c.speed);
                 if (c.y === c.floor) {

@@ -1,10 +1,11 @@
-// run it: node play.mjs
+// run it: node play.mjs, or node play.mjs volcano (or any weather or disaster) to keep one on for a look at it, or
+// node play.mjs world 5 to start in the fifth world
 import { readFileSync, writeFileSync } from "node:fs";
 
 import { autopilot } from "./autopilot.mjs";
 import { TICK_MS, input, keysIn, newGame, scoreOf, step } from "./game.mjs";
 import { MIN_COLUMNS, MIN_ROWS, render } from "./terminal.mjs";
-import { weatherAt } from "./weather.mjs";
+import { DISASTERS, WEATHERS } from "./weather.mjs";
 
 const { stdin, stdout } = process;
 
@@ -25,10 +26,11 @@ const readRecord = () => {
 const TAB_REPEAT_MS = 350;
 let lastTab = 0;
 let record = readRecord();
-const game = newGame();
-// the weather keeps its own clock, so it carries on through a restart
-const weatherSeed = Date.now() | 0;
-let weatherTicks = 0;
+const args = process.argv.slice(2);
+const startIn = args[0] === "world" ? Math.max(1, Math.floor(Number(args[1])) || 1) : 1;
+const game = newGame(undefined, { world: startIn - 1 });
+const held = args.join(" ").toLowerCase();
+if ([...WEATHERS, ...DISASTERS].includes(held)) game.holdSky = held;
 
 const saveRecord = () => {
     if (game.assisted || scoreOf(game) <= record) return;
@@ -56,7 +58,7 @@ const draw = () => {
     const small = stdout.columns < MIN_COLUMNS || stdout.rows < MIN_ROWS;
     const lines = small
         ? [`Make this window at least ${MIN_COLUMNS} x ${MIN_ROWS}.`, `It's ${stdout.columns} x ${stdout.rows} now.`]
-        : render(game, record, { ...weatherAt(weatherSeed, weatherTicks), t: weatherTicks });
+        : render(game, record);
     stdout.write(`\x1b[H${lines.join("\x1b[K\r\n")}\x1b[K\x1b[J`);
 };
 
@@ -85,7 +87,6 @@ stdin.on("data", (data) => {
 setInterval(() => {
     autopilot(game);
     step(game);
-    weatherTicks += 1;
     if (game.phase === "over") saveRecord();
     draw();
 }, TICK_MS);

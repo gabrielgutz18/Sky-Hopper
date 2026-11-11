@@ -4,7 +4,7 @@
 // cloud top that leads into the next place
 // every section knows how far along the whole chain it starts, so progress, the autopilot and tidying up all go by that
 // one number, dist
-import { ERAS, eraOf, placeOf } from "./places.mjs";
+import { ERAS, PLACES, eraOf, placeOf } from "./places.mjs";
 
 // the window, in cells and rows
 export const W = 44;
@@ -21,6 +21,9 @@ const GATE_SECTION = 3;
 const PLACE_SECTIONS = 4;
 // tunnels are dug far below everything, so nothing from up top is ever in view down there
 const TUNNEL_DEPTH = 400;
+// how far the very hard ground after a door goes on
+const HARD_STRETCH = 80;
+const DOOR_CHANCE = 0.45;
 // how high a tunnel's roof sits over its floor; well over a jump, so the roof is only scenery
 export const TUNNEL_ROOF = 13;
 
@@ -42,7 +45,8 @@ export const sectionOf = (g, id) => g.sections.find((s) => s.id === id);
 // how far along the chain a spot in a section is: across for a run, up for a climb, and a tunnel doesn't count
 export function distAt(sec, x, y) {
     if (sec.kind === "climb") return sec.start + (y - sec.y0);
-    if (sec.kind === "tunnel") return sec.start;
+    // a tunnel doesn't count towards how far Claude has got, but its plates still go in order, for the autopilot
+    if (sec.kind === "tunnel") return sec.start + (x - sec.x0) * sec.dir * 0.01;
     return sec.start + (x - sec.x0) * sec.dir;
 }
 
@@ -88,23 +92,34 @@ export const safeCenter = (p) => {
     return (from + to) / 2;
 };
 
+// how hard the ground is: it gets harder through the first four worlds, and then again every lap of all seventeen
 const level = (g) => Math.min(3, g.gen.place);
+const lapsIn = (g) => Math.floor(g.gen.place / PLACES.length);
+// each lap fewer plates are plain, they're shorter and further apart (never past a jump), and more creatures are about
+const plainShare = (g, base, least) => Math.max(least, base - 0.07 * lapsIn(g));
+const shorter = (g) => Math.min(2, lapsIn(g));
+const wider = (g) => Math.min(3, lapsIn(g));
+const crowded = (g) => 0.04 * Math.min(4, lapsIn(g));
 
 function climbKind(g) {
     const roll = rand(g);
-    if (roll < 0.48) return "plain";
-    if (roll < 0.68) return "moving";
-    if (roll < 0.82) return "crumble";
-    if (roll < 0.9) return "spring";
+    const plain = plainShare(g, 0.48, 0.3);
+    if (roll < plain) return "plain";
+    const rest = (roll - plain) / (1 - plain);
+    if (rest < 0.385) return "moving";
+    if (rest < 0.654) return "crumble";
+    if (rest < 0.808) return "spring";
     return g.hazards ? "spike" : "plain";
 }
 
 // no springs on the ground: one would throw Claude far over the next stretch
 function runKind(g) {
     const roll = rand(g);
-    if (roll < 0.62) return "plain";
-    if (roll < 0.76) return "moving";
-    if (roll < 0.9) return "crumble";
+    const plain = plainShare(g, 0.62, 0.34);
+    if (roll < plain) return "plain";
+    const rest = (roll - plain) / (1 - plain);
+    if (rest < 0.37) return "moving";
+    if (rest < 0.74) return "crumble";
     return g.hazards ? "spike" : "plain";
 }
 
@@ -112,7 +127,12 @@ function runKind(g) {
 // and droppers hang above it waiting for Claude to pass under. a creature that can't stand on a plate that moves or
 // crumbles flies instead
 export function addCreature(g, sec, plate, kind) {
-    const style = kind.style === "walk" || kind.style === "hop" ? (plate.kind === "plain" && plate.len >= 8 ? kind.style : "fly") : kind.style;
+    // walkers and hoppers need a plain plate long enough to pace. up a climb each plate is the one way on, and one with
+    // a creature pacing it or hanging over it could leave nowhere to land, so there they all fly instead
+    const grounded = kind.style === "walk" || kind.style === "hop" || kind.style === "drop";
+    // a dropper hangs over the far end of a long plate, so there's always somewhere to land clear of it
+    const roomy = plate.kind === "plain" && plate.len >= (kind.style === "drop" ? 14 : 8);
+    const style = grounded && (sec.kind === "climb" || !roomy) ? "fly" : kind.style;
     const speed = kind.speed * between(g, 0.85, 1.15);
     const dir = rand(g) < 0.5 ? -1 : 1;
     const base = { kind: kind.id, name: kind.name, style, dir, speed, phase: "idle", t: whole(g, 0, 40), cool: 0 };
@@ -122,7 +142,8 @@ export function addCreature(g, sec, plate, kind) {
         const x = between(g, plate.x, plate.x + plate.len - 3);
         c = { ...base, x, y: plate.y + 1, ground: plate.y + 1, low: plate.x, high: plate.x + plate.len - 3 };
     } else if (style === "drop") {
-        const x = Math.round(between(g, plate.x + 1, plate.x + plate.len - 4));
+        const x = (sec.dir ?? 1) > 0 ? plate.x + plate.len - 4 : plate.x + 1;
+        plate.dropper = true;
         c = { ...base, x, y: plate.y + 8, top: plate.y + 8, floor: plate.y + 1, low: x, high: x };
     } else if (style === "swoop") {
         const y = plate.y + whole(g, 6, 7);
@@ -145,12 +166,16 @@ function buildRun(g) {
     const dir = gen.dir;
     const sec = addSection(g, { kind: "run", dir, x0: gen.x0 ?? (dir > 0 ? from.x + from.len : from.x), y0: from.y, start: gen.dist, place: gen.place });
     gen.x0 = undefined;
-    const length = whole(g, 90, 130);
+    // about half the runs have a door, and are longer to fit the hard ground after it
+    const wantDoor = rand(g) < DOOR_CHANCE;
+    const length = whole(g, 90, 130) + (wantDoor ? HARD_STRETCH + 20 : 0);
     const shrink = level(g);
     let edge = dir > 0 ? from.x + from.len : from.x;
     let y = from.y;
     let pieces = 0;
-    let door = false;
+    let door = null;
+    // after a door, the ground is very hard going up to here; the door's tunnel goes under it all
+    let hardEnd = null;
     let last = from;
     // the next piece of ground, gap cells on from the edge so far
     const lay = (gap, dy, len, kind) => {
@@ -165,10 +190,29 @@ function buildRun(g) {
         pieces += 1;
         return plate;
     };
-    while ((edge - sec.x0) * dir < length) {
+    const along = () => (edge - sec.x0) * dir;
+    // tiny, crumbling, sliding and spiked pieces over wide gaps, crawling with creatures: possible, but only just
+    const hardPiece = () => {
+        const roll = rand(g);
+        const kind = roll < 0.3 ? "crumble" : roll < 0.55 ? "moving" : roll < 0.75 && g.hazards ? "spike" : "plain";
+        const plate = lay(whole(g, 15, 19), whole(g, -2, 2), kind === "spike" ? 12 : whole(g, 5, 7), kind);
+        plate.hard = true;
+        if (g.hazards && rand(g) < 0.5 + crowded(g)) addCreature(g, sec, plate, placeOf(sec.place).creature);
+    };
+    while (along() < length) {
+        if (hardEnd !== null) {
+            if (along() < hardEnd) {
+                hardPiece();
+                continue;
+            }
+            // solid ground again past the hard stretch, which is where the tunnel comes back up
+            door.skipTo = lay(whole(g, 4, 5), 0, 14, "plain").dist;
+            hardEnd = null;
+            continue;
+        }
         // a gap too wide to jump, with ropes over it; the ground either side is always solid and still, so nobody has
         // to jump for a rope off crumbling ground
-        if (pieces > 0 && last.kind === "plain" && rand(g) < 0.18 + 0.03 * shrink) {
+        if (pieces > 0 && last.kind === "plain" && !last.door && !last.dropper && rand(g) < 0.18 + 0.03 * shrink) {
             const ropes = rand(g) < 0.4 ? 2 : 1;
             const first = whole(g, 13, 14);
             const spacing = whole(g, 19, 21);
@@ -182,17 +226,22 @@ function buildRun(g) {
             lay(gap, 0, whole(g, 14, 20), "plain");
             continue;
         }
-        const kind = pieces === 0 ? "plain" : runKind(g);
-        const len = kind === "spike" ? whole(g, 13, 16) : whole(g, 9, 18) - shrink;
-        const plate = lay(whole(g, 3, 6 + shrink), pieces === 0 ? 0 : whole(g, -2, 2), len, kind);
-        if (!door && kind === "plain" && len >= 12 && pieces > 1 && rand(g) < 0.3) {
-            door = true;
+        const doorHere = wantDoor && !door && pieces >= 2;
+        const kind = pieces === 0 || doorHere ? "plain" : runKind(g);
+        const len = doorHere ? 14 : kind === "spike" ? whole(g, 13, 16) : Math.max(6, whole(g, 9, 18) - shrink - shorter(g));
+        const plate = lay(whole(g, 3, 6 + shrink + wider(g)), pieces === 0 ? 0 : whole(g, -2, 2), len, kind);
+        // a door, like a pipe: the tunnel under it is the easy way past the very hard ground that comes next
+        if (doorHere) {
             const x = Math.round(plate.x + plate.len / 2 - 2);
-            g.doors.push({ n: g.serial, sec: sec.id, x, y: plate.y, era: whole(g, 0, ERAS.length - 1), dist: distAt(sec, x + 2, plate.y) });
+            door = { n: g.serial, sec: sec.id, x, y: plate.y, era: whole(g, 0, ERAS.length - 1), dist: distAt(sec, x + 2, plate.y) };
             g.serial += 1;
+            g.doors.push(door);
+            plate.door = door.n;
+            hardEnd = along() + HARD_STRETCH;
+            continue;
         }
         if (rand(g) < 0.3) addStar(g, sec, safeCenter(plate), plate.y + 2);
-        if (g.hazards && pieces > 2 && rand(g) < 0.1 + 0.03 * shrink) {
+        if (g.hazards && pieces > 2 && rand(g) < 0.1 + 0.03 * shrink + crowded(g)) {
             addCreature(g, sec, plate, placeOf(sec.place).creature);
         }
     }
@@ -217,7 +266,7 @@ function buildClimb(g, gate) {
     const inColumn = (center, len) => Math.round(clamp(center - len / 2, x0 + 1, x0 + W - len - 1));
     while (y < from.y + height) {
         const kind = y - from.y < 8 ? "plain" : climbKind(g);
-        let len = whole(g, 9 - shrink, 14 - shrink);
+        let len = Math.max(6, whole(g, 9 - shrink, 14 - shrink) - shorter(g));
         if (kind === "spike") len = Math.max(len, 12);
         const reach = kind === "moving" ? 10 : 14;
         const center = clamp(lastCenter + between(g, -reach, reach), x0 + 7, x0 + W - 7);
@@ -238,7 +287,7 @@ function buildClimb(g, gate) {
             }
         }
         if (rand(g) < 0.25) addStar(g, sec, safeCenter(plate), y + 2);
-        if (g.hazards && y - from.y > 10 && rand(g) < 0.12 + 0.04 * shrink) addCreature(g, sec, plate, placeOf(sec.place).creature);
+        if (g.hazards && y - from.y > 10 && rand(g) < 0.12 + 0.04 * shrink + crowded(g)) addCreature(g, sec, plate, placeOf(sec.place).creature);
         y += whole(g, 3, Math.min(6, 4 + shrink));
     }
     let top;
@@ -259,8 +308,8 @@ function buildClimb(g, gate) {
     gen.dir = rand(g) < 0.5 ? -1 : 1;
 }
 
-// lays the world out from the start: a long first plate, then section after section
-export function startWorld(g) {
+// lays the world out from the start: a long first plate, then section after section; place is the world it starts in
+export function startWorld(g, place = 0) {
     g.sections = [];
     g.nextSection = 0;
     g.serial = 0;
@@ -269,12 +318,12 @@ export function startWorld(g) {
     g.creatures = [];
     g.ropes = [];
     g.doors = [];
-    const first = { kind: "run", dir: 1, x0: 4, y0: 0, start: 0, place: 0 };
+    const first = { kind: "run", dir: 1, x0: 4, y0: 0, start: 0, place };
     const start = makePlate(g, { ...first, id: -1 }, -12, 0, 40, "plain");
     start.sec = 0;
     start.path = true;
     g.plates.push(start);
-    g.gen = { dist: 0, dir: 1, place: 0, step: 0, last: start, x0: 4 };
+    g.gen = { dist: 0, dir: 1, place, step: 0, last: start, x0: 4 };
     // the start plate belongs to the first run, which then carries on from its far end
     buildAhead(g, 1);
     start.sec = g.sections[0].id;
@@ -308,7 +357,7 @@ export function digTunnel(g, door) {
     const surface = sectionOf(g, door.sec);
     const dir = surface?.dir ?? 1;
     const y0 = door.y - TUNNEL_DEPTH;
-    const sec = addSection(g, { kind: "tunnel", dir, x0: door.x + 2, y0, start: door.dist, place: surface?.place ?? 0, era: door.era, door: door.n });
+    const sec = addSection(g, { kind: "tunnel", dir, x0: door.x + 2, y0, start: door.dist, place: surface?.place ?? 0, era: door.era, door: door.n, skipTo: door.skipTo ?? door.dist + 70 });
     const entry = makePlate(g, sec, door.x - 4, y0, 12, "plain");
     entry.path = true;
     g.plates.push(entry);
@@ -330,7 +379,8 @@ export function digTunnel(g, door) {
             const star = { x: Math.round(x + 1 + rand(g) * (len - 2)), y: y + whole(g, 2, 4), dist: sec.start, tunnel: sec.id };
             g.stars.push(star);
         }
-        if (g.hazards && i > 0 && rand(g) < 0.35) {
+        // never over the way out, which is somewhere to stand still for a moment
+        if (g.hazards && i > 0 && i < pieces - 1 && rand(g) < 0.35) {
             addCreature(g, sec, plate, eraOf(sec.era).creature);
         }
     }
@@ -343,7 +393,7 @@ export function digTunnel(g, door) {
 // where a tunnel comes back up: the first wide, solid stretch of ground some way past its door
 export function tunnelExit(g, sec) {
     buildAhead(g, sec.start + 220);
-    const skip = sec.start + 70;
+    const skip = sec.skipTo;
     const ground = g.plates
         .filter((p) => p.tunnel === undefined && p.path && p.kind === "plain" && p.len >= 8 && p.dist >= skip && sectionOf(g, p.sec)?.kind === "run")
         .sort((a, b) => a.dist - b.dist)[0];

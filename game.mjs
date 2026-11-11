@@ -2,10 +2,14 @@
 // tests can play it too; terminal.mjs draws it as text, index.html as pixel art, and autopilot.mjs plays it
 // heights count up from the first plate; a plate at y holds Claude, whose feet are at y + 1. x is in cells across the
 // whole world, and the window is W cells of it, wherever the camera is
+import { holdIn, lapOf, moveFight, shoot, startFight } from "./bosses.mjs";
 import { hazardDanger, moveHazards, skySeedOf, updateSky, windPush, windSwing } from "./hazards.mjs";
 import { ASPECT, BODY_W, CRUMBLE_TICKS, H, W, buildAhead, clamp, digTunnel, progressOf, safeCenter, sectionOf, startWorld, tidy, tunnelExit, whole } from "./world.mjs";
 
-export { BODY_W, CRUMBLE_TICKS, H, W, safeCenter, sectionOf };
+export { BODY_W, CRUMBLE_TICKS, H, W, lapOf, safeCenter, sectionOf };
+// a crumbled plate grows back after this long: with two in a row gone the gap could be too wide to jump, and Claude
+// would be stuck with no way on (in a tunnel, with nothing to fall to, for good)
+export const REGROW_TICKS = 80;
 
 export const TICK_MS = 50;
 export const GRAVITY = 0.06;
@@ -34,10 +38,12 @@ const BEHIND = 70;
 export const WARP_TICKS = 12;
 const TUNNEL_BONUS = 100;
 
-export function newGame(seed = Date.now() | 0, { hazards = true } = {}) {
+// world starts the game further on, in that world (counting from 0), for a look at it or a test
+export function newGame(seed = Date.now() | 0, { hazards = true, world = 0 } = {}) {
     const g = {
         seed,
         hazards,
+        startWorld: world,
         auto: false,
         assisted: false,
         aim: null,
@@ -45,7 +51,7 @@ export function newGame(seed = Date.now() | 0, { hazards = true } = {}) {
         planPause: 0,
         overWait: 0,
         phase: "title",
-        stage: 1,
+        stage: world + 1,
         camera: -5,
         camX: 0,
         // the section Claude last stood in, the height of that ground, and how far along the chain its plate was
@@ -70,10 +76,15 @@ export function newGame(seed = Date.now() | 0, { hazards = true } = {}) {
         impacts: [],
         strikeWait: 40,
         fireWait: 40,
+        // the boss fight on now, if any (see bosses.mjs), and the last boss beaten, for its banner
+        fight: null,
+        beaten: null,
+        // crumbled plates waiting to grow back
+        regrow: [],
         claude: { x: 2, y: 1, vy: 0, vx: 0, on: null, dir: 0, left: 0, want: 0, fluttered: false, rope: null, cool: 0, lastRope: -1, moved: 0 },
     };
     updateSky(g);
-    startWorld(g);
+    startWorld(g, world);
     g.claude.on = g.plates[0];
     g.lastDist = g.plates[0].dist;
     g.camX = g.claude.x + BODY_W / 2 - W / 2 + 6;
@@ -107,17 +118,20 @@ function land(g, p) {
     }
 }
 
-// a cloud top counts once Claude is level with it or above, over it, even if a spring threw it straight past
+// a cloud top is reached once Claude is level with it or above, over it, even if a spring threw it straight past.
+// its boss guards it: reaching it starts the fight, and only beating the boss counts it (see bosses.mjs)
 function passCloudTops(g) {
+    if (g.fight) return;
     const { claude } = g;
     const middle = claude.x + BODY_W / 2;
+    // landing on the next place's ground counts too: from the side of a climb Claude can jump straight onto it, and
+    // the boss pulls it back in
+    const past = (p) => g.tunnel === null && claude.on && claude.on.kind !== "top" && claude.on.zone === p.zone;
     for (const p of g.plates) {
         if (p.kind !== "top" || p.done) continue;
-        if (claude.y >= p.y + 1 && claude.y - p.y < 14 && middle >= p.x - 2 && middle <= p.x + p.len + 2) {
-            p.done = true;
-            g.stage += 1;
-            g.bonus += 500;
-            g.banner = 50;
+        if ((claude.y >= p.y + 1 && claude.y - p.y < 14 && middle >= p.x - 2 && middle <= p.x + p.len + 2) || past(p)) {
+            startFight(g, p);
+            return;
         }
     }
 }
@@ -130,7 +144,7 @@ function jump(claude) {
 
 export const restart = (g) => {
     const { auto, holdSky } = g;
-    Object.assign(g, newGame(g.seed, { hazards: g.hazards }), { phase: "playing", auto, assisted: auto, holdSky });
+    Object.assign(g, newGame(g.seed, { hazards: g.hazards, world: g.startWorld }), { phase: "playing", auto, assisted: auto, holdSky });
 };
 
 // the door Claude is standing in, if any
@@ -308,7 +322,11 @@ export function act(g, key) {
             claude.fluttered = true;
             claude.vy = Math.max(claude.vy, FLUTTER);
         }
+    } else if (key === "f" || key === "e") {
+        shoot(g);
     } else if (key === "s") {
+        // the arena's floor is solid: no dropping out of a fight
+        if (g.fight && claude.on?.kind === "top") return;
         const door = doorAt(g);
         if (door) enterTunnel(g, door);
         else if (claude.rope) letGo(g, false);
@@ -328,6 +346,18 @@ export function keysIn(data) {
 }
 
 // ---- one tick ----
+
+// crumbled plates come back whole once their time's up
+function regrowPlates(g) {
+    for (const r of g.regrow) r.t -= 1;
+    for (const r of g.regrow) {
+        if (r.t > 0) continue;
+        r.plate.broken = false;
+        r.plate.t = 0;
+        g.plates.push(r.plate);
+    }
+    g.regrow = g.regrow.filter((r) => r.t > 0);
+}
 
 function moveThings(g) {
     const { claude } = g;
@@ -350,16 +380,18 @@ function moveThings(g) {
             }
         }
     }
+    for (const p of g.plates) if (p.broken && p.kind === "crumble") g.regrow.push({ plate: p, t: REGROW_TICKS });
     g.plates = g.plates.filter((p) => !p.broken);
+    regrowPlates(g);
     for (const b of g.bolts) b.t -= 1;
     g.bolts = g.bolts.filter((b) => b.t > 0);
-    // no lightning underground
-    if (g.hazards && g.best > 20 && g.tunnel === null) {
+    // no lightning underground or in a boss fight; it comes more often each lap
+    if (g.hazards && g.best > 20 && g.tunnel === null && !g.fight) {
         g.boltWait -= 1;
         if (g.boltWait <= 0) {
             const left = Math.round(g.camX);
             g.bolts.push({ x: whole(g, left + 1, left + W - 4), t: BOLT_WARNING + BOLT_STRIKE });
-            g.boltWait = Math.max(30, whole(g, 70, 130) - g.stage * 10);
+            g.boltWait = Math.max(Math.max(18, 34 - 4 * lapOf(g.stage - 1)), whole(g, 70, 130) - g.stage * 10);
         }
     }
 }
@@ -436,7 +468,11 @@ function checkDanger(g) {
 function moveCamera(g) {
     const { claude } = g;
     const sec = sectionOf(g, g.sec);
-    if (sec?.kind === "climb" && g.lastDist < sec.start + sec.len) {
+    // in a boss fight the screen locks onto the arena
+    if (g.fight) {
+        g.camera += (g.fight.floor - 2 - g.camera) * 0.2;
+        g.camX += (g.fight.x0 - g.camX) * 0.2;
+    } else if (sec?.kind === "climb" && g.lastDist < sec.start + sec.len) {
         if (g.best > 10) g.camera += Math.min(0.07, 0.01 + 0.008 * g.stage);
         g.camera = Math.max(g.camera, claude.y - Math.floor(H * 0.55));
         g.camX += (sec.x0 - g.camX) * 0.15;
@@ -456,8 +492,10 @@ export function step(g) {
     updateSky(g);
     if (g.banner > 0) g.banner -= 1;
     if (g.warp > 0) g.warp -= 1;
+    if (g.beaten && --g.beaten.t <= 0) g.beaten = null;
     moveThings(g);
     moveClaude(g);
+    if (g.fight) holdIn(g);
     passCloudTops(g);
     const { claude } = g;
     if (claude.on) {
@@ -470,7 +508,8 @@ export function step(g) {
     }
     // a rope belongs to the ground it hangs over, even when Claude jumped for it straight from the top of a climb
     if (claude.rope) g.sec = ropeOf(g, claude.rope.n)?.sec ?? g.sec;
-    checkDanger(g);
+    if (g.fight) moveFight(g);
+    if (g.phase === "playing") checkDanger(g);
     if (g.phase === "playing") checkTunnelExit(g);
     if (g.phase === "playing") moveCamera(g);
 }
