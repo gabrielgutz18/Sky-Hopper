@@ -1,0 +1,1233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sky Hop</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+    :root { color-scheme: dark; }
+    html, body { margin: 0; height: 100%; background: #07070d; }
+    body { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; overflow: hidden; touch-action: none; }
+    canvas { display: block; image-rendering: pixelated; image-rendering: crisp-edges; }
+    .pad { display: none; gap: 8px; }
+    @media (pointer: coarse) { .pad { display: flex; } }
+    .pad button {
+        font: 11px "Press Start 2P", monospace; color: #f4f4f8; background: #1d1d30;
+        border: 2px solid #44446a; border-radius: 6px; min-width: 60px; min-height: 56px;
+        touch-action: none; user-select: none; -webkit-user-select: none;
+    }
+    .pad button:active { background: #36365a; }
+</style>
+</head>
+<body>
+<canvas id="screen" aria-label="Sky Hop. Arrow keys or A and D to move, Space to jump and to let go of a rope, S to go down a tunnel door."></canvas>
+<div class="pad">
+    <button data-key="a" aria-label="Move left">&lt;</button>
+    <button data-key=" ">JUMP</button>
+    <button data-key="w">FLAP</button>
+    <button data-key="s" aria-label="Drop, or go into a door">DOWN</button>
+    <button data-key="d" aria-label="Move right">&gt;</button>
+</div>
+<script type="module">
+// the 16-bit Sky Hop: the same rules as the terminal game (game.mjs), drawn as pixel art
+// run it with: node serve.mjs, then open http://localhost:8765
+import { autopilot } from "./autopilot.mjs";
+import { BOLT_STRIKE, CRUMBLE_TICKS, H, HANDS, TICK_MS, W, WARP_TICKS, doorAt, input, newGame, scoreOf, sectionOf, step } from "./game.mjs";
+import { codeLine, eraOf, placeOf, themeOf, wordFor } from "./places.mjs";
+import { DISASTERS, WEATHERS, weatherAt } from "./weather.mjs";
+
+// one cell of the game's grid is 8 x 12 pixels, so the window is 352 x 240 under a 16 pixel score bar
+const CW = 8;
+const CH = 12;
+const HUD = 16;
+const VW = W * CW;
+const VH = HUD + H * CH;
+const FONT = '"Press Start 2P", monospace';
+const INK = "#0b0b14";
+const CLAUDE = { body: "#d97757", light: "#eda183", shade: "#b0573a", ink: "#2b1209", eye: "#141414" };
+
+const canvas = document.getElementById("screen");
+const ctx = canvas.getContext("2d");
+canvas.width = VW;
+canvas.height = VH;
+
+const mod = (n, m) => ((n % m) + m) % m;
+const rect = (x, y, w, h, color) => {
+    ctx.fillStyle = color;
+    ctx.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h));
+};
+const text = (s, x, y, color, size = 8) => {
+    ctx.font = `${size}px ${FONT}`;
+    ctx.fillStyle = color;
+    ctx.textBaseline = "top";
+    ctx.fillText(s, Math.round(x), Math.round(y));
+};
+const centered = (s, y, color, size = 8) => {
+    ctx.font = `${size}px ${FONT}`;
+    text(s, (VW - ctx.measureText(s).width) / 2, y, color, size);
+};
+// a word with a dark outline, for anything drawn over a busy picture
+const outlined = (s, y, color, size = 8) => {
+    ctx.font = `${size}px ${FONT}`;
+    const x = (VW - ctx.measureText(s).width) / 2;
+    for (const [dx, dy] of [[-1, 0], [1, 0], [0, -1], [0, 1], [2, 2]]) text(s, x + dx, y + dy, INK, size);
+    text(s, x, y, color, size);
+};
+const hash = (n) => {
+    let t = Math.imul(n ^ 0x9e3779b9, 0x85ebca6b);
+    t ^= t >>> 13;
+    t = Math.imul(t, 0xc2b2ae35);
+    t ^= t >>> 16;
+    return (t >>> 0) / 4294967296;
+};
+
+// ---- the game, the keys and the best score ----
+
+const BEST_KEY = "sky-hop-best";
+let record = 0;
+try {
+    record = Number(localStorage.getItem(BEST_KEY)) || 0;
+} catch {
+    // no saved best in this browser; the game itself is fine
+}
+const g = newGame();
+
+const saveBest = () => {
+    if (g.assisted || scoreOf(g) <= record) return;
+    record = scoreOf(g);
+    try {
+        localStorage.setItem(BEST_KEY, String(record));
+    } catch {
+        // not saved, but still shown for this visit
+    }
+};
+
+// a browser says when a key is let go, so walking stops the moment it is, unlike in a terminal
+const held = [];
+const press = (key) => {
+    wakeAudio();
+    if (key === "a" || key === "d") {
+        if (!held.includes(key)) held.push(key);
+        input(g, key);
+        return;
+    }
+    if (key === "r") saveBest();
+    if (key === "m") {
+        muted = !muted;
+        return;
+    }
+    input(g, key);
+};
+const release = (key) => {
+    const at = held.indexOf(key);
+    if (at < 0) return;
+    held.splice(at, 1);
+    if (held.length === 0 && !g.auto) g.claude.left = 0;
+};
+
+const KEYS = {
+    ArrowLeft: "a", KeyA: "a", ArrowRight: "d", KeyD: "d",
+    Space: " ", ArrowUp: "w", KeyW: "w", ArrowDown: "s", KeyS: "s",
+    Enter: "\r", Tab: "\t", KeyR: "r", KeyM: "m",
+};
+addEventListener("keydown", (e) => {
+    const key = KEYS[e.code];
+    if (!key) return;
+    e.preventDefault();
+    // a held Tab repeats by itself, and must count as one press rather than flicking the autopilot on and off
+    if (e.repeat && key !== "a" && key !== "d") return;
+    press(key);
+});
+addEventListener("keyup", (e) => {
+    const key = KEYS[e.code];
+    if (key) release(key);
+});
+canvas.addEventListener("pointerdown", () => press(" "));
+for (const button of document.querySelectorAll(".pad button")) {
+    const key = button.dataset.key;
+    button.addEventListener("pointerdown", (e) => {
+        e.preventDefault();
+        press(key);
+    });
+    for (const type of ["pointerup", "pointerleave", "pointercancel"]) button.addEventListener(type, () => release(key));
+}
+
+function fit() {
+    const pad = matchMedia("(pointer: coarse)").matches ? 90 : 0;
+    const room = Math.min(innerWidth / VW, (innerHeight - pad - 24) / VH);
+    // whole-number scaling keeps every pixel square; a phone too narrow for that gets the nearest fit
+    const scale = room >= 1 ? Math.floor(room) : room;
+    canvas.style.width = `${Math.floor(VW * scale)}px`;
+    canvas.style.height = `${Math.floor(VH * scale)}px`;
+}
+addEventListener("resize", fit);
+fit();
+
+// ---- chiptune blips ----
+
+let audio = null;
+let muted = false;
+function wakeAudio() {
+    try {
+        audio ??= new AudioContext();
+        if (audio.state === "suspended") audio.resume();
+    } catch {
+        audio = null;
+    }
+}
+function tone(freqs, dur = 0.06, type = "square", vol = 0.05) {
+    if (!audio || muted) return;
+    const start = audio.currentTime;
+    freqs.forEach((freq, i) => {
+        const osc = audio.createOscillator();
+        const gain = audio.createGain();
+        const t = start + i * dur;
+        osc.type = type;
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(vol, t);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t + dur * 0.95);
+        osc.connect(gain).connect(audio.destination);
+        osc.start(t);
+        osc.stop(t + dur);
+    });
+}
+function noise(dur = 0.35, vol = 0.12) {
+    if (!audio || muted) return;
+    const buffer = audio.createBuffer(1, Math.floor(audio.sampleRate * dur), audio.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < data.length; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / data.length);
+    const source = audio.createBufferSource();
+    const gain = audio.createGain();
+    gain.gain.value = vol;
+    source.buffer = buffer;
+    source.connect(gain).connect(audio.destination);
+    source.start();
+}
+
+// ---- the weather: its own seed and its own clock, so it carries on through a restart and never touches the rules ----
+
+const WEATHER_SEED = (Math.random() * 2 ** 31) | 0;
+let weatherTicks = 0;
+// ?sky=rain (or snow, volcano, meteor-shower...) holds one weather or disaster on for a look at it
+const params = new URLSearchParams(location.search);
+const heldSky = (params.get("sky") ?? "").replace(/-/g, " ").toLowerCase();
+const skyNow = (t) => {
+    const real = weatherAt(WEATHER_SEED, t);
+    if (WEATHERS.includes(heldSky)) return { ...real, weather: heldSky, amount: 1 };
+    if (DISASTERS.includes(heldSky)) return { ...real, disaster: heldSky, power: 1, age: real.disaster === heldSky ? real.age : 100 };
+    return real;
+};
+let sky = skyNow(0);
+// a thunderstorm's lightning comes in windows of this many ticks, and lights up the start of some of them
+const THUNDER_EVERY = 36;
+const thunderIn = (t) => sky.weather === "thunderstorm" && sky.amount > 0.4 && hash(Math.floor(t / THUNDER_EVERY) * 7 + WEATHER_SEED) < 0.35;
+const thunderNow = (t) => thunderIn(t) && mod(t, THUNDER_EVERY) < 4;
+
+// ---- what happened this tick: sounds, dust and sparkles ----
+
+const particles = [];
+let shake = 0;
+let flash = 0;
+let deathAt = 0;
+let deathX = 0;
+let deathY = 0;
+let clock = 0;
+let frame = 0;
+
+const puff = (x, y, n, color, spread = 0.12, rise = 0.04) => {
+    for (let i = 0; i < n; i++) {
+        particles.push({
+            x: x + (Math.random() - 0.5) * 2,
+            y,
+            vx: (Math.random() - 0.5) * spread * 2,
+            vy: Math.random() * rise,
+            life: 10 + Math.random() * 8,
+            color,
+        });
+    }
+};
+
+function events(before) {
+    const { claude } = g;
+    const middle = claude.x + 2.5;
+    if (before.phase === "playing" && g.phase === "over") {
+        deathAt = clock;
+        deathX = claude.x;
+        deathY = claude.y;
+        shake = 7;
+        noise(0.4);
+        tone([330, 247, 196, 131], 0.11, "square", 0.05);
+        puff(middle, claude.y + 1, 14, CLAUDE.body, 0.35, 0.2);
+        return;
+    }
+    if (g.tunnel !== null && before.tunnel === null) tone([523, 392, 330, 262, 196], 0.06, "triangle", 0.06);
+    if (g.tunnel === null && before.tunnel !== null) tone([262, 330, 392, 523, 659, 784], 0.05, "square", 0.04);
+    if (g.stage > before.stage) tone([523, 659, 784, 1047, 784, 1047], 0.08);
+    if (mod(g.bonus - before.bonus, 500) === 50) {
+        tone([988, 1319], 0.07, "square", 0.04);
+        puff(middle, claude.y + 1.5, 8, "#ffd84a", 0.3, 0.2);
+    }
+    if (claude.rope && !before.rope) {
+        tone([330, 494], 0.05, "triangle", 0.06);
+        puff(middle, claude.y + 2, 4, "#c9a26a", 0.15, 0.05);
+        return;
+    }
+    if (!claude.rope && before.rope) {
+        tone([494, 659, 880], 0.04, "square", 0.04);
+        return;
+    }
+    if (claude.vy > 1.3 && before.vy <= 1.3) {
+        tone([392, 523, 659, 784, 1047], 0.035, "square", 0.04);
+        puff(middle, claude.y, 8, "#ff8ee6", 0.25, 0.05);
+    } else if (before.on && !claude.on && claude.vy > 0.5) {
+        tone([440, 660], 0.05, "square", 0.035);
+        puff(middle, claude.y, 5, "#e8e8f0");
+    } else if (!before.on && !claude.on && !claude.rope && claude.vy - before.vy > 0.3) {
+        tone([660, 880], 0.04, "triangle", 0.05);
+        puff(middle, claude.y, 4, "#cfe8ff");
+    } else if (!before.on && claude.on) {
+        puff(middle, claude.y, 4, "#e8e8f0", 0.15, 0.02);
+    }
+    if (g.bolts.some((b) => b.t === BOLT_STRIKE)) {
+        flash = 0.35;
+        noise(0.25, 0.08);
+    }
+}
+
+// the weather's sounds: thunder after a flash, and a low rumble through an earthquake
+function weatherSounds() {
+    if (g.tunnel !== null) return;
+    if (thunderIn(weatherTicks) && mod(weatherTicks, THUNDER_EVERY) === 3) noise(0.9, 0.05);
+    if (sky.disaster === "earthquake" && sky.power > 0.3 && mod(weatherTicks, 24) === 0) noise(0.5, 0.035 * sky.power);
+}
+
+// ---- the clock: the rules tick twenty times a second, and the drawing slides smoothly between ticks ----
+
+let prev = null;
+function snapshot() {
+    const xs = new Map();
+    for (const p of g.plates) xs.set(p, p.x);
+    for (const b of g.birds) xs.set(b, b.x);
+    return { ticks: g.ticks, claude: g.claude, cx: g.claude.x, cy: g.claude.y, cam: g.camera, camX: g.camX, xs, tunnel: g.tunnel };
+}
+
+function tick() {
+    if (held.length && !g.auto) input(g, held[held.length - 1]);
+    prev = snapshot();
+    const before = { on: g.claude.on, rope: g.claude.rope, vy: g.claude.vy, bonus: g.bonus, phase: g.phase, stage: g.stage, tunnel: g.tunnel };
+    autopilot(g);
+    step(g);
+    events(before);
+    weatherTicks += 1;
+    sky = skyNow(weatherTicks);
+    weatherSounds();
+    if (g.phase === "over") saveBest();
+    for (const p of particles) {
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy -= 0.01;
+        p.life -= 1;
+    }
+    for (let i = particles.length - 1; i >= 0; i--) if (particles[i].life <= 0) particles.splice(i, 1);
+}
+
+let acc = 0;
+let last = performance.now();
+function loop(now) {
+    acc += Math.min(250, now - last);
+    last = now;
+    while (acc >= TICK_MS) {
+        tick();
+        acc -= TICK_MS;
+    }
+    draw(acc / TICK_MS);
+    requestAnimationFrame(loop);
+}
+
+// ---- where things go on screen ----
+
+// the top pixel of a row, the pixel line at a height (where feet at that height stand), and a cell's left edge
+let cam = 0;
+let camX = 0;
+const rowTop = (y) => Math.round(HUD + (H - 1 - (y - cam)) * CH);
+const py = (y) => Math.round(HUD + (H - y + cam) * CH);
+const px = (x) => Math.round((x - camX) * CW);
+
+// what Claude is in: a tunnel's era, or the place it has reached
+const tunnelNow = () => (g.tunnel !== null ? sectionOf(g, g.tunnel) : null);
+const themeNow = () => {
+    const sec = tunnelNow();
+    return sec ? eraOf(sec.era) : placeOf(g.stage - 1);
+};
+
+// ---- the sky: a banded, dithered gradient per place, drawn once and kept ----
+
+const hex = (c) => [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16));
+const mix = (a, b, t) => {
+    const [x, y] = [hex(a), hex(b)];
+    return `rgb(${x.map((v, i) => Math.round(v + (y[i] - v) * t)).join(",")})`;
+};
+const skies = new Map();
+function skyFor(theme) {
+    const { name, look } = theme;
+    if (skies.has(name)) return skies.get(name);
+    const canvasSky = document.createElement("canvas");
+    canvasSky.width = VW;
+    canvasSky.height = VH - HUD;
+    const s = canvasSky.getContext("2d");
+    const BANDS = 8;
+    const band = canvasSky.height / BANDS;
+    for (let b = 0; b < BANDS; b++) {
+        s.fillStyle = mix(look.sky[0], look.sky[1], b / (BANDS - 1));
+        s.fillRect(0, b * band, VW, band);
+        if (b === BANDS - 1) continue;
+        // a checkerboard where one band meets the next, the way 16-bit skies faked a gradient
+        s.fillStyle = mix(look.sky[0], look.sky[1], (b + 1) / (BANDS - 1));
+        for (let y = (b + 1) * band - 4; y < (b + 1) * band; y++) {
+            const stepX = y < (b + 1) * band - 2 ? 4 : 2;
+            for (let x = mod(y, 2); x < VW; x += stepX) s.fillRect(x, y, 1, 1);
+        }
+    }
+    skies.set(name, canvasSky);
+    return canvasSky;
+}
+
+// far stars drift slowest, both ways
+function drawFar() {
+    const fx = camX * CW * 0.15;
+    const fy = cam * CH * 0.15;
+    for (let i = 0; i < 70; i++) {
+        const a = hash(i * 7 + 1);
+        const b = hash(i * 13 + 3);
+        const x = mod(a * VW * 2 - fx, VW * 2);
+        const y = HUD + mod(b * (VH - HUD) * 2 + fy, (VH - HUD) * 2);
+        if (x >= VW || y >= VH) continue;
+        const twinkle = mod(frame + Math.floor(b * 400), 180) < 10;
+        rect(x, y, 1, 1, twinkle ? "#ffffff" : "rgba(255,255,255,0.45)");
+        if (a > 0.92) {
+            rect(x - 1, y, 3, 1, "rgba(255,255,255,0.35)");
+            rect(x, y - 1, 1, 3, "rgba(255,255,255,0.35)");
+        }
+    }
+}
+
+// a skyline far off along the bottom, in the place's own shapes: web towers with aerials, BIOS chips with pins, dark
+// spires, cloud server racks, mainframe cabinets, and graphics cards with cooling fins
+const SKYLINE = ["aerial", "pins", "spire", "puff", "stripes", "fins"];
+function drawSkyline(theme, placeIndex) {
+    const style = SKYLINE[mod(placeIndex, SKYLINE.length)];
+    const look = theme.look;
+    const shift = camX * CW * 0.35;
+    const base = VH;
+    for (let i = Math.floor(shift / 30) - 1; i < Math.floor(shift / 30) + VW / 30 + 2; i++) {
+        const w = 18 + Math.floor(hash(i * 3 + 5) * 10);
+        const h = 26 + Math.floor(hash(i * 11 + 7) * 50);
+        const x = Math.round(i * 30 - shift);
+        const top = base - h;
+        rect(x, top, w, h, mix(look.dark, "#000000", 0.45));
+        rect(x, top, 1, h, mix(look.dark, "#000000", 0.2));
+        // lit windows, a few blinking
+        for (let wy = top + 5; wy < base - 4; wy += 7) {
+            for (let wx = x + 3; wx < x + w - 3; wx += 5) {
+                const lit = hash(i * 97 + wx * 7 + wy * 13);
+                if (lit < 0.45) rect(wx, wy, 2, 3, lit < 0.06 && mod(frame >> 5, 2) ? look.text : mix(look.light, "#000000", 0.55));
+            }
+        }
+        if (style === "aerial") {
+            rect(x + w / 2, top - 10, 1, 10, mix(look.dark, "#000000", 0.3));
+            if (mod(frame >> 4, 2)) rect(x + w / 2 - 1, top - 11, 3, 2, "#ff3b3b");
+        } else if (style === "pins") {
+            for (let p = x + 2; p < x + w - 1; p += 3) rect(p, top - 3, 1, 3, mix(look.light, "#000000", 0.5));
+        } else if (style === "spire") {
+            for (let k = 0; k < 8; k++) rect(x + w / 2 - (8 - k) / 2, top - k * 2, 8 - k, 2, mix(look.dark, "#000000", 0.45));
+        } else if (style === "puff") {
+            for (let k = -1; k < 3; k++) rect(x + k * 6, top - 6 + Math.abs(k - 1) * 2, 10, 6, mix(look.light, look.sky[1], 0.6));
+        } else if (style === "stripes") {
+            for (let sy = top + 2; sy < base; sy += 8) rect(x, sy, w, 1, mix(look.light, "#000000", 0.35));
+        } else if (style === "fins") {
+            for (let fx2 = x + 1; fx2 < x + w - 1; fx2 += 2) rect(fx2, top - 4, 1, 4, mix(look.plate, "#000000", 0.3));
+        }
+    }
+}
+
+// the place's words, a little nearer than the stars
+function drawWords(theme) {
+    const near = cam * 0.6;
+    const nearX = camX * 0.6;
+    ctx.globalAlpha = 0.16;
+    for (let r = Math.floor(near) - 1; r <= near + H + 1; r++) {
+        const col = mod(r * 37 + 11 - Math.floor(nearX), W * 3);
+        if (col >= W) continue;
+        const y = Math.round(HUD + (H - 1 - (r - near)) * CH) + 2;
+        text(wordFor(theme, r), col * CW - mod(nearX, 1) * CW, y, theme.look.light);
+    }
+    ctx.globalAlpha = 1;
+}
+
+// underground: rock walls in the era's dark colour, a jagged roof, and the dim glow of an old screen
+function drawTunnelBack(sec, theme) {
+    const look = theme.look;
+    const shift = camX * CW * 0.5;
+    for (let y = HUD; y < VH; y += 8) {
+        const row = Math.floor((y + cam * CH * 0.5) / 8);
+        const offset = mod(row, 2) * 8;
+        for (let x = -mod(shift + offset, 16); x < VW; x += 16) rect(x, y, 15, 7, mix(look.plate, "#000000", 0.75 + hash(row * 31 + Math.floor((x + shift) / 16)) * 0.15));
+    }
+    const roof = py(sec.roof);
+    if (roof > HUD) {
+        rect(0, HUD, VW, roof - HUD, mix(look.plate, "#000000", 0.85));
+        for (let x = -mod(camX * CW, 12); x < VW; x += 12) {
+            const k = Math.floor((x + camX * CW) / 12);
+            const drip = 4 + Math.floor(hash(k * 5) * 10);
+            for (let d = 0; d < drip; d++) rect(x + d / 2, roof + d, 10 - d, 1, mix(look.plate, "#000000", 0.8));
+        }
+    }
+}
+
+// ---- plates ----
+
+function block(x, y, cells, fill, light, dark) {
+    const w = cells * CW;
+    rect(x, y, w, CH, INK);
+    rect(x + 1, y + 1, w - 2, CH - 2, fill);
+    rect(x + 1, y + 1, w - 2, 1, light);
+    rect(x + 1, y + CH - 2, w - 2, 1, dark);
+}
+
+function codeBlock(x, y, cells, theme, n, from = 0, inside = cells) {
+    const { look } = theme;
+    block(x, y, cells, look.plate, look.light, look.dark);
+    const { line, left } = codeLine(theme, n, inside);
+    [...line].forEach((ch, i) => text(ch, x + (from + left + i) * CW, y + 2, look.text));
+}
+
+function arrow(x, y, dir) {
+    for (let c = 0; c < 4; c++) {
+        const col = dir < 0 ? x + c : x + 3 - c;
+        rect(col, y + 5 - c, 1, 2 + 2 * c, "#8ff7ff");
+    }
+}
+
+function drawPlate(p, at) {
+    const x = px(at);
+    const y = rowTop(p.y);
+    if (y > VH || y < HUD - CH * 2 || x > VW || x + p.len * CW < 0) return;
+    const theme = themeOf(p);
+    if (p.kind === "plain") codeBlock(x, y, p.len, theme, p.n);
+    if (p.kind === "moving") {
+        codeBlock(x, y, p.len, theme, p.n, 1, p.len - 2);
+        arrow(x + 2, y, -1);
+        arrow(x + p.len * CW - 6, y, 1);
+    }
+    if (p.kind === "crumble") {
+        // old code turned to stone: it shakes and cracks once stood on, then gives way
+        const breaking = p.t > 0 ? 1 - p.t / CRUMBLE_TICKS : 0;
+        const sx = p.t > 0 ? (mod(frame >> 1, 2) ? 1 : -1) : 0;
+        block(x + sx, y, p.len, breaking > 0.5 ? "#6d6052" : "#8b7b68", "#b3a48f", "#5a4c3d");
+        for (let i = 2; i < p.len * CW - 2; i += 16) rect(x + sx + i + (p.y % 2) * 8, y + 2, 1, CH - 4, "#5a4c3d");
+        if (breaking > 0) {
+            for (let i = 0; i < p.len; i += 2) {
+                if (hash(p.n * 31 + i) > breaking) continue;
+                const cx = x + sx + i * CW + 3;
+                rect(cx, y + 2, 1, 3, INK);
+                rect(cx + 1, y + 5, 1, 3, INK);
+                rect(cx, y + 8, 1, 2, INK);
+            }
+        }
+    }
+    if (p.kind === "spring") {
+        block(x, y, p.len, "#ff4fd8", "#ffa6ef", "#a3238a");
+        for (let i = 0; i < p.len; i++) text("+", x + i * CW, y + 2, "#ffffff");
+        if (mod(frame >> 3, 2)) {
+            for (let i = 1; i < p.len; i += 3) {
+                const cx = x + i * CW + 4;
+                rect(cx - 1, y - 5, 2, 1, "#ffa6ef");
+                rect(cx - 2, y - 4, 1, 1, "#ffa6ef");
+                rect(cx + 1, y - 4, 1, 1, "#ffa6ef");
+            }
+        }
+    }
+    if (p.kind === "spike") {
+        // a good line of code with a syntax error stuck on one end
+        const atStart = p.spikeX === p.x;
+        const safe = p.len - p.spikeLen;
+        const safeX = atStart ? x + p.spikeLen * CW : x;
+        const errX = atStart ? x : x + safe * CW;
+        codeBlock(safeX, y, safe, theme, p.n);
+        block(errX, y, p.spikeLen, "#e0303a", "#ff7a80", "#8a0f17");
+        for (let i = 0; i < p.spikeLen; i++) {
+            const cx = errX + i * CW;
+            for (let j = 0; j < 4; j++) rect(cx + 3 - j, y - 4 + j, 2 + 2 * j, 1, j === 0 ? "#ffd0d0" : "#ff4a52");
+            text("!", cx, y + 2, "#ffffff");
+        }
+    }
+    if (p.kind === "top") {
+        // the cloud top: puffy, as wide as the climb, and it says which place comes next
+        const w = p.len * CW;
+        for (let i = -6; i < w + 12; i += 22) {
+            const r = 7 + Math.floor(hash(i * 3 + p.n) * 5);
+            const cx = x + i + 11;
+            for (let dy = 0; dy <= r; dy++) {
+                const hw = Math.round(Math.sqrt(r * r - dy * dy));
+                rect(cx - hw - 1, y + 3 - dy, hw * 2 + 2, 1, dy === r ? "#c9d6f0" : "#f4f8ff");
+            }
+        }
+        rect(x, y, w, CH, "#f4f8ff");
+        rect(x, y + CH - 3, w, 3, "#b9c8e8");
+        const next = placeOf(p.zone).name.toUpperCase();
+        const label = p.done ? `${next} ZONE` : `UP NEXT: ${next}`;
+        ctx.font = `8px ${FONT}`;
+        text(label, x + (w - ctx.measureText(label).width) / 2, y + 2, "#1d2b5a");
+    }
+}
+
+// ---- ropes, doors and the way out of a tunnel ----
+
+function drawRope(r) {
+    const { claude } = g;
+    const ax = px(r.ax);
+    const ay = py(r.ay);
+    if (ax < -120 || ax > VW + 120) return;
+    let ex;
+    let ey;
+    if (claude.rope?.n === r.n) {
+        // held: down to Claude's hands, wherever the drawing has slid Claude to
+        ex = px(drawnCx + 2.5);
+        ey = py(drawnCy + HANDS);
+    } else {
+        // hanging free, swaying a little in the breeze
+        const a = Math.sin(clock * 1.3 + r.n) * 0.06;
+        ex = ax + Math.sin(a) * r.len * CH;
+        ey = ay + Math.cos(a) * r.len * CH;
+    }
+    // the beam it hangs from
+    rect(ax - 9, ay - 5, 18, 5, INK);
+    rect(ax - 8, ay - 4, 16, 3, "#5c6170");
+    rect(ax - 8, ay - 4, 16, 1, "#9aa0b0");
+    const steps = Math.max(4, Math.ceil(Math.hypot(ex - ax, ey - ay) / 2));
+    for (let i = 0; i <= steps; i++) {
+        const x = ax + ((ex - ax) * i) / steps;
+        const y = ay + ((ey - ay) * i) / steps;
+        rect(x - 1, y, 2, 2, mod(i, 3) === 0 ? "#7a5530" : "#c9a26a");
+    }
+    if (claude.rope?.n !== r.n) rect(ex - 2, ey - 1, 4, 3, "#7a5530");
+}
+
+function drawDoor(d) {
+    const era = eraOf(d.era);
+    const x = px(d.x);
+    const base = py(d.y + 1);
+    if (x < -60 || x > VW + 60) return;
+    const w = 32;
+    const h = 30;
+    // a stone archway glowing in the era's colour, dark inside, with lines of old code flickering in the dark
+    rect(x - 3, base - h - 3, w + 6, h + 3, INK);
+    rect(x - 2, base - h - 2, w + 4, h + 2, d.used ? "#3a3a3a" : era.look.light);
+    rect(x, base - h, w, h, "#030303");
+    if (!d.used) {
+        for (let line = 0; line < 4; line++) {
+            const len = 4 + Math.floor(hash(d.n * 7 + line + (frame >> 4)) * 20);
+            rect(x + 4, base - h + 5 + line * 6, len, 2, mix(era.look.light, "#000000", 0.5));
+        }
+    } else {
+        for (let k = 0; k < 3; k++) rect(x - 2, base - h + 6 + k * 8, w + 4, 3, "#6d5a40");
+    }
+    const name = era.name.toUpperCase();
+    ctx.font = `8px ${FONT}`;
+    const nw = ctx.measureText(name).width;
+    text(name, x + w / 2 - nw / 2 + 1, base - h - 13, INK);
+    text(name, x + w / 2 - nw / 2, base - h - 14, d.used ? "#777777" : era.look.light);
+    // a bouncing arrow when Claude is standing in it: press down to go in
+    if (!d.used && doorAt(g) === d && !g.auto) {
+        const bob = mod(frame >> 3, 2) * 2;
+        for (let k = 0; k < 4; k++) rect(x + w / 2 - 4 + k, base - h - 26 + bob + k, 8 - k * 2, 1, "#ffffff");
+    }
+}
+
+function drawExit(sec) {
+    const x = px(sec.exit.x);
+    const base = py(sec.exit.y + 1);
+    const w = 32;
+    const h = 30;
+    const glow = mod(frame >> 3, 2) ? "#ffe680" : "#ffd84a";
+    rect(x - 3, base - h - 3, w + 6, h + 3, INK);
+    rect(x - 2, base - h - 2, w + 4, h + 2, glow);
+    rect(x, base - h, w, h, "#fff4c0");
+    for (let k = 0; k < 4; k++) rect(x + 6 + k * 6, base - h + 4, 2, h - 4, "rgba(255,255,255,0.7)");
+    ctx.font = `8px ${FONT}`;
+    text("EXIT", x + w / 2 - ctx.measureText("EXIT").width / 2, base - h - 14, glow);
+}
+
+// ---- the rest of the cast ----
+
+const STAR = ["...o...", "..ooo..", "ooooooo", ".ooooo.", "..ooo..", ".oo.oo.", "oo...oo"];
+function drawStar(s) {
+    const bob = Math.round(Math.sin((frame + s.x * 9) / 10) * 1.5);
+    const x = px(s.x);
+    const y = rowTop(s.y) + 2 + bob;
+    if (x < -8 || x > VW) return;
+    STAR.forEach((row, r) => [...row].forEach((ch, c) => ch === "o" && rect(x + c, y + r, 1, 1, r < 3 ? "#ffe680" : "#ffc21a")));
+}
+
+// a bug: a green beetle with see-through wings, buzzing back and forth
+function drawBug(b, at) {
+    const x = px(at);
+    const y = rowTop(b.y);
+    if (x < -24 || x > VW + 8) return;
+    const flap = mod(frame >> 2, 2);
+    const f = b.dir;
+    const cx = x + 12 - f * 2;
+    const cy = y + 6;
+    ctx.globalAlpha = 0.75;
+    if (flap) {
+        rect(cx - 7, cy - 9, 5, 4, "#d8f6ff");
+        rect(cx, cy - 9, 5, 4, "#d8f6ff");
+    } else {
+        rect(cx - 8, cy - 5, 6, 2, "#d8f6ff");
+        rect(cx + 1, cy - 5, 6, 2, "#d8f6ff");
+    }
+    ctx.globalAlpha = 1;
+    for (const lx of [-5, -1, 3]) rect(cx + lx + flap, cy + 3, 1, 3, "#10240f");
+    const shell = [[-4, 8], [-3, 12], [-2, 14], [-1, 14], [0, 14], [1, 12], [2, 10]];
+    rect(cx - 4, cy - 5, 8, 1, INK);
+    rect(cx - 5, cy + 3, 10, 1, INK);
+    for (const [dy, w] of shell) rect(cx - w / 2 - 1, cy + dy, w + 2, 1, INK);
+    for (const [dy, w] of shell) rect(cx - w / 2, cy + dy, w, 1, dy < -2 ? "#7cf08a" : "#3fcf52");
+    rect(cx - 3, cy - 2, 2, 2, "#1f7a2c");
+    rect(cx + 2, cy - 1, 2, 2, "#1f7a2c");
+    const hx = cx + f * 8 - 2;
+    rect(hx - 1, cy - 3, 6, 6, INK);
+    rect(hx, cy - 2, 4, 4, "#1f7a2c");
+    rect(hx + (f > 0 ? 2 : 0), cy - 2, 2, 2, "#ffffff");
+    rect(hx + (f > 0 ? 3 : 0), cy - 1, 1, 1, INK);
+    rect(hx + (f > 0 ? 4 : -1), cy - 4, 1, 1, INK);
+    rect(hx + (f > 0 ? 5 : -2), cy - 5, 1, 1, INK);
+}
+
+function drawBolt(b) {
+    const x = px(b.x);
+    if (b.t > BOLT_STRIKE) {
+        // the warning: a red column and flashing signs where the exception will land
+        const blink = mod(frame >> 3, 2);
+        rect(x, HUD, 24, VH - HUD, blink ? "rgba(255,60,60,0.16)" : "rgba(255,60,60,0.08)");
+        for (let y = HUD + 6; y < VH; y += CH * 2) text("!", x + 8, y, blink ? "#ffdd33" : "#ff4a4a");
+        return;
+    }
+    rect(x, HUD, 24, VH - HUD, "rgba(255,255,210,0.16)");
+    for (let y = HUD, seg = 0; y < VH; y += 6, seg++) {
+        const zig = [0, 3, 5, 2, -2, -4, -1][seg % 7];
+        rect(x + 7 + zig, y, 10, 6, "rgba(255,236,120,0.45)");
+        rect(x + 10 + zig, y, 4, 6, "#ffffff");
+    }
+}
+
+// Claude: an orange rectangle with two eyes, two arms out to the sides (or up, on a rope) and four feet
+function drawClaude(x, bottom, pose = {}) {
+    const { legs = 5, armDy = 0, bob = 0, stride = -1, eyes = "open", look = 0, armsUp = false } = pose;
+    const bx = x + 6;
+    const bw = 28;
+    const bh = 14;
+    const top = bottom - legs - bh + bob;
+    [3, 9, 16, 22].forEach((lx, i) => {
+        const lift = stride >= 0 && i % 2 === stride ? 2 : 0;
+        const lh = bottom - lift - (top + bh);
+        rect(bx + lx - 1, top + bh, 5, lh + 1, CLAUDE.ink);
+        rect(bx + lx, top + bh, 3, lh, CLAUDE.shade);
+    });
+    if (armsUp) {
+        // both hands up on the rope, over the middle of the head
+        rect(bx + 8, top - 9, 5, 10, CLAUDE.ink);
+        rect(bx + 9, top - 8, 3, 9, CLAUDE.body);
+        rect(bx + 15, top - 9, 5, 10, CLAUDE.ink);
+        rect(bx + 16, top - 8, 3, 9, CLAUDE.body);
+    } else {
+        const ay = top + 5 + armDy;
+        rect(bx - 6, ay - 1, 7, 6, CLAUDE.ink);
+        rect(bx - 5, ay, 5, 4, CLAUDE.body);
+        rect(bx + bw - 1, ay - 1, 7, 6, CLAUDE.ink);
+        rect(bx + bw, ay, 5, 4, CLAUDE.body);
+    }
+    rect(bx - 1, top - 1, bw + 2, bh + 2, CLAUDE.ink);
+    rect(bx, top, bw, bh, CLAUDE.body);
+    rect(bx, top, bw, 1, CLAUDE.light);
+    rect(bx, top + bh - 2, bw, 2, CLAUDE.shade);
+    rect(bx + bw - 1, top, 1, bh, CLAUDE.shade);
+    for (const ex of [bx + 7 + look, bx + 18 + look]) {
+        const ey = top + 4;
+        if (eyes === "dead") {
+            for (let i = 0; i < 4; i++) {
+                rect(ex + i - 1, ey + i, 1, 1, CLAUDE.eye);
+                rect(ex + 2 - i, ey + i, 1, 1, CLAUDE.eye);
+            }
+        } else if (eyes === "blink") {
+            rect(ex, ey + 3, 3, 1, CLAUDE.eye);
+        } else if (eyes === "happy") {
+            rect(ex, ey + 2, 1, 2, CLAUDE.eye);
+            rect(ex + 1, ey + 1, 1, 1, CLAUDE.eye);
+            rect(ex + 2, ey + 2, 1, 2, CLAUDE.eye);
+        } else {
+            const tall = eyes === "wide" ? 6 : 5;
+            rect(ex, ey - (tall - 5), 3, tall, CLAUDE.eye);
+            rect(ex, ey - (tall - 5), 1, 1, "#ffffff");
+        }
+    }
+}
+
+function claudePose() {
+    const { claude } = g;
+    const look = claude.left > 0 ? claude.dir : 0;
+    if (claude.rope) return { legs: 7, armsUp: true, eyes: Math.abs(claude.rope.w) > 0.05 ? "happy" : "open", look: Math.sign(claude.rope.w) };
+    if (claude.on) {
+        if (claude.left > 0) return { stride: mod(frame >> 3, 2), look };
+        return { bob: mod(frame >> 5, 2), eyes: mod(frame, 200) < 8 ? "blink" : "open", look };
+    }
+    if (claude.vy > 1.2) return { legs: 3, armDy: -4, eyes: "happy", look };
+    if (claude.vy > 0) return { legs: 3, armDy: -3, look };
+    return { legs: 6, armDy: mod(frame >> 2, 2) ? -2 : 0, eyes: claude.vy < -0.8 ? "wide" : "open", look };
+}
+
+// ---- weather behind the world: a darker or dustier sky, far lightning, and the big scenery of a disaster ----
+
+// a pseudo-random spot for particle i of a kind, moving with the weather clock; nothing is stored, so it costs nothing
+const spot = (i, salt) => hash(i * 7919 + salt);
+
+function drawWeatherBack(t) {
+    const a = sky.amount;
+    const tint = { rain: "rgba(20,30,50,", thunderstorm: "rgba(10,14,30,", sandstorm: "rgba(150,100,40,", snow: "rgba(200,210,230,", fog: "rgba(150,160,180," }[sky.weather];
+    const depth = { rain: 0.35, thunderstorm: 0.55, sandstorm: 0.4, snow: 0.18, fog: 0.25 }[sky.weather];
+    if (tint && a > 0) rect(0, HUD, VW, VH - HUD, `${tint}${(depth * a).toFixed(3)})`);
+
+    // far lightning in a thunderstorm: a fork across the sky for a few ticks
+    if (thunderNow(t)) {
+        const k = Math.floor(t / THUNDER_EVERY);
+        let x = 40 + hash(k * 3) * (VW - 80);
+        for (let y = HUD; y < VH - 40; y += 6) {
+            const nx = x + (hash(k * 31 + y) - 0.5) * 12;
+            rect(Math.min(x, nx), y, Math.abs(nx - x) + 2, 6, "rgba(225,235,255,0.85)");
+            if (hash(k * 17 + y) < 0.12) rect(nx, y, 14 * (hash(y) - 0.5), 2, "rgba(225,235,255,0.6)");
+            x = nx;
+        }
+    }
+
+    const p = sky.power;
+    if (!sky.disaster || p <= 0) return;
+    const d = sky.disaster;
+    if (d === "volcano") {
+        // a far mountain, its crater glowing and throwing lava up into the sky
+        const peakX = VW * 0.72 - mod(camX * CW * 0.1, 40);
+        const peakY = VH - 150;
+        for (let y = peakY; y < VH; y++) {
+            const hw = 10 + (y - peakY) * 1.1;
+            rect(peakX - hw, y, hw * 2, 1, y < peakY + 4 ? "#5a1d0a" : "#2a1510");
+        }
+        rect(peakX - 10, peakY - 2, 20, 4, `rgba(255,${Math.round(120 + 60 * Math.sin(t / 3))},30,${p})`);
+        for (let i = 0; i < 26; i++) {
+            const life = 34 + spot(i, 1) * 20;
+            const ph = mod(t + spot(i, 2) * life, life) / life;
+            const vx = (spot(i, 3) - 0.5) * 2.4;
+            const vy = 4.5 + spot(i, 4) * 2.5;
+            const x = peakX + vx * ph * life;
+            const y = peakY - (vy * ph * life - 0.18 * (ph * life) ** 2);
+            rect(x, y, 2, 2, ph < 0.5 ? "#ffd84a" : "#ff6a1a");
+        }
+        rect(0, VH - 60, VW, 60, `rgba(255,90,20,${0.16 * p})`);
+    }
+    if (d === "tornado") {
+        // a twisting funnel crossing far off, wide at the cloud and narrow at the ground
+        const cx = mod(t * 0.7 + VW * 0.6 + 80, VW + 160) - 80;
+        for (let k = 0; k < 24; k++) {
+            const y = VH - 8 - k * 9;
+            const w = 6 + k * 2.6;
+            const sway = Math.sin(t / 7 + k / 3) * k * 0.7;
+            rect(cx + sway - w / 2, y, w, 9, `rgba(70,72,84,${0.8 * p})`);
+            rect(cx + sway - w / 2 + mod(t * 2 + k * 5, w), y + 3, 4, 2, `rgba(170,170,185,${0.6 * p})`);
+        }
+        rect(0, HUD, VW, 24, `rgba(40,40,50,${0.5 * p})`);
+        for (let i = 0; i < 14; i++) {
+            const ang = t / 5 + i * 1.7;
+            const r = 14 + spot(i, 5) * 40;
+            const y = VH - 30 - spot(i, 6) * 150;
+            rect(cx + Math.cos(ang) * r, y + Math.sin(ang) * 4, 3, 2, "#3b2f24");
+        }
+    }
+    if (d === "meteor shower") {
+        // streaks of fire across the sky, and a flash on the horizon where one comes down
+        for (let i = 0; i < 9; i++) {
+            const life = 46 + spot(i, 8) * 40;
+            const ph = mod(t + spot(i, 9) * life, life) / life;
+            const sx = spot(i, 10) * VW * 1.2 - 20;
+            if (ph < 0.45) {
+                const k = ph / 0.45;
+                const x = sx + k * 140;
+                const y = HUD + 10 + k * (VH - HUD - 60);
+                for (let tail = 0; tail < 10; tail++) rect(x - tail * 4, y - tail * 3, 3, 2, `rgba(255,${200 - tail * 14},${120 - tail * 10},${(1 - tail / 10) * p})`);
+                rect(x, y, 4, 4, "#fff6c0");
+            } else if (ph < 0.55) {
+                const r = (ph - 0.45) * 300;
+                const x = sx + 140;
+                rect(x - r, VH - 50 - r / 3, r * 2, r / 1.5, `rgba(255,220,150,${0.5 * p * (1 - (ph - 0.45) * 10)})`);
+            }
+        }
+    }
+}
+
+// ---- disasters down at the city: a flood over it, a fire through it, cracks across it ----
+
+function drawDisasterLow(t) {
+    const p = sky.power;
+    if (!sky.disaster || p <= 0) return;
+    const d = sky.disaster;
+    if (d === "flood") {
+        // water rising over the city, sloshing in waves
+        const level = VH - 14 - 70 * p;
+        for (let x = 0; x < VW; x += 2) {
+            const wave = Math.sin(x / 14 + t / 5) * 3 + Math.sin(x / 5 + t / 3) * 1.2;
+            rect(x, level + wave, 2, VH - level - wave, `rgba(40,96,170,${0.55 * p})`);
+            rect(x, level + wave, 2, 1, `rgba(180,220,255,${0.7 * p})`);
+        }
+        for (let i = 0; i < 6; i++) rect(mod(spot(i, 7) * VW + t * 0.6, VW + 20) - 10, level + Math.sin(t / 5 + i) * 3 - 1, 8, 2, "#5a4630");
+    }
+    if (d === "wildfire") {
+        // a red glow, and flames along the city
+        rect(0, VH - 90, VW, 90, `rgba(255,70,20,${0.22 * p})`);
+        // smoke billowing up from the fire, drifting off with the wind
+        for (let i = 0; i < 7; i++) {
+            const baseX = spot(i, 34) * VW;
+            for (let k = 0; k < 9; k++) {
+                const rise = mod(t * 0.8 + k * 14 + spot(i, 35) * 100, 126);
+                const r = 6 + rise / 9;
+                rect(baseX + rise * 0.5 - r, VH - 40 - rise - r / 2, r * 2, r, `rgba(45,35,32,${0.4 * p * (1 - rise / 126)})`);
+            }
+        }
+        for (let x = 0; x < VW; x += 4) {
+            const h = (14 + Math.abs(Math.sin(x / 9 + t / 2)) * 26 + hash(x + (t >> 1)) * 12) * p;
+            rect(x, VH - h, 4, h, x % 8 ? "rgba(255,110,25,0.8)" : "rgba(255,190,50,0.8)");
+            rect(x + 1, VH - h * 0.45, 2, h * 0.45, "rgba(255,240,170,0.8)");
+        }
+    }
+    if (d === "earthquake") {
+        // cracks spreading across the far ground
+        for (let c = 0; c < 4; c++) {
+            let x = 30 + c * 90;
+            let y = VH - 40;
+            const reach = 10 * p;
+            for (let s = 0; s < reach; s++) {
+                const nx = x + (hash(c * 99 + s) - 0.4) * 14;
+                const ny = y + 4;
+                rect(Math.min(x, nx), y, Math.abs(nx - x) + 1, 4, "#140c06");
+                x = nx;
+                y = ny;
+            }
+        }
+    }
+}
+
+// ---- weather in front: rain, sand, snow, fog, and what a disaster throws about ----
+
+function drawWeatherFront(t) {
+    const a = sky.amount;
+    if (sky.weather === "rain" || sky.weather === "thunderstorm") {
+        const n = Math.round((sky.weather === "thunderstorm" ? 170 : 100) * a);
+        for (let i = 0; i < n; i++) {
+            const near = i % 3 === 0;
+            const speed = near ? 16 : 10;
+            const len = near ? 7 : 4;
+            const y = HUD + mod(spot(i, 11) * VH + t * speed, VH - HUD + 20) - 10;
+            const x = mod(spot(i, 12) * (VW + 80) - (y - HUD) * 0.35 - camX * CW * (near ? 1 : 0.5), VW + 80) - 40;
+            for (let k = 0; k < len; k++) rect(x - k * 0.35, y + k, 1, 1, near ? "rgba(200,215,245,0.75)" : "rgba(160,180,220,0.45)");
+        }
+        // little splashes on the platforms in view
+        for (const p of g.plates) {
+            const y = rowTop(p.y);
+            if (y < HUD || y > VH) continue;
+            for (let s = 0; s < p.len; s += 3) {
+                const ph = mod(t + hash(p.n * 13 + s) * 20, 20);
+                if (ph > 2 || hash(p.n * 7 + s) > a) continue;
+                const x = px(p.x + s + 1);
+                rect(x - 2, y - 2 - ph, 1, 1, "rgba(210,225,255,0.8)");
+                rect(x + 2, y - 2 - ph, 1, 1, "rgba(210,225,255,0.8)");
+                rect(x, y - 1, 1, 1, "rgba(210,225,255,0.8)");
+            }
+        }
+    }
+    if (sky.weather === "sandstorm") {
+        const n = Math.round(140 * a);
+        for (let i = 0; i < n; i++) {
+            const speed = 9 + spot(i, 13) * 9;
+            const x = mod(spot(i, 14) * (VW + 80) * 2 + t * speed, VW + 80) - 40;
+            const y = HUD + spot(i, 15) * (VH - HUD) + Math.sin(t / 5 + i) * 3;
+            const long = i % 4 === 0;
+            rect(x, y, long ? 9 : 2, 1, long ? "rgba(235,190,120,0.55)" : "rgba(210,160,90,0.8)");
+        }
+        rect(0, HUD, VW, VH - HUD, `rgba(190,130,60,${0.18 * a})`);
+    }
+    if (sky.weather === "snow") {
+        const n = Math.round(120 * a);
+        for (let i = 0; i < n; i++) {
+            const depth = i % 3;
+            const speed = 0.7 + depth * 0.7;
+            const y = HUD + mod(spot(i, 16) * VH + t * speed, VH - HUD);
+            const x = mod(spot(i, 17) * VW + Math.sin(t / 18 + i) * (4 + depth * 3) - camX * CW * (0.3 + depth * 0.3), VW);
+            const size = depth === 2 ? 2 : 1;
+            rect(x, y, size, size, depth === 0 ? "rgba(255,255,255,0.5)" : "rgba(255,255,255,0.9)");
+        }
+    }
+    if (sky.weather === "fog") {
+        for (let k = 0; k < 5; k++) {
+            const y = HUD + (k + 0.5) * ((VH - HUD) / 5) + Math.sin(t / 60 + k) * 10;
+            const drift = t * (0.3 + k * 0.1) - camX * CW * 0.6;
+            for (let x = -mod(drift, 60) - 60; x < VW + 60; x += 60) {
+                const h = 10 + hash(k * 31 + Math.floor((x + drift) / 60)) * 14;
+                for (let s = 0; s < 3; s++) rect(x + s * 6, y - h / 2 + s * 2, 60 - s * 12, h - s * 4, `rgba(220,225,235,${0.07 * a})`);
+            }
+        }
+    }
+
+    const p = sky.power;
+    if (!sky.disaster || p <= 0) return;
+    const d = sky.disaster;
+    if (d === "volcano") {
+        // ash drifting down, and embers floating up
+        for (let i = 0; i < 70 * p; i++) {
+            const y = HUD + mod(spot(i, 18) * VH + t * (0.8 + spot(i, 19)), VH - HUD);
+            const x = mod(spot(i, 20) * VW + Math.sin(t / 20 + i) * 6, VW);
+            rect(x, y, 2, 1, "rgba(120,110,105,0.75)");
+        }
+        for (let i = 0; i < 18 * p; i++) {
+            const y = VH - mod(spot(i, 21) * VH + t * 1.6, VH - HUD);
+            rect(mod(spot(i, 22) * VW + Math.sin(t / 9 + i) * 8, VW), y, 1, 1, mod(t + i, 6) < 3 ? "#ffb347" : "#ff5a1a");
+        }
+    }
+    if (d === "wildfire") {
+        rect(0, HUD, VW, VH - HUD, `rgba(70,40,30,${0.22 * p})`);
+        for (let i = 0; i < 40 * p; i++) {
+            const y = VH - mod(spot(i, 23) * VH + t * (1.2 + spot(i, 24)), VH - HUD);
+            rect(mod(spot(i, 25) * VW + Math.sin(t / 7 + i) * 10, VW), y, 2, 1, mod(t + i, 8) < 4 ? "#ffcf4a" : "#ff6a1a");
+        }
+    }
+    if (d === "earthquake") {
+        // dust and small stones shaken loose from above
+        for (let i = 0; i < 30 * p; i++) {
+            const y = HUD + mod(spot(i, 26) * VH + t * (3 + spot(i, 27) * 3), VH - HUD);
+            const big = i % 5 === 0;
+            rect(mod(spot(i, 28) * VW, VW), y, big ? 3 : 1, big ? 3 : 1, big ? "#6b5a48" : "rgba(170,150,120,0.7)");
+        }
+    }
+    if (d === "tornado") {
+        for (let i = 0; i < 10; i++) {
+            const x = mod(spot(i, 29) * VW + t * (6 + spot(i, 30) * 6), VW + 20) - 10;
+            const y = HUD + spot(i, 31) * (VH - HUD) + Math.sin(t / 3 + i) * 8;
+            rect(x, y, 3, 2, "rgba(60,50,40,0.8)");
+        }
+    }
+    if (d === "flood" && sky.amount < 0.3) {
+        // a flood comes with rain even when the sky itself is clear
+        for (let i = 0; i < 60 * p; i++) {
+            const y = HUD + mod(spot(i, 32) * VH + t * 12, VH - HUD + 20) - 10;
+            const x = mod(spot(i, 33) * (VW + 80) - (y - HUD) * 0.3, VW + 80) - 40;
+            rect(x, y, 1, 4, "rgba(170,190,230,0.55)");
+        }
+    }
+}
+
+// ---- the score bar and the screens over the world ----
+
+function drawHud() {
+    const theme = themeNow();
+    const best = g.assisted ? record : Math.max(record, scoreOf(g));
+    rect(0, 0, VW, HUD, INK);
+    rect(0, HUD - 2, VW, 2, theme.look.plate);
+    text(theme.name.toUpperCase(), 4, 4, theme.look.light);
+    const right = `DIST ${g.best}  SCORE ${scoreOf(g)}  HI ${best}`;
+    ctx.font = `8px ${FONT}`;
+    text(right, VW - 4 - ctx.measureText(right).width, 4, "#f4f4f8");
+}
+
+const dim = () => rect(0, HUD, VW, VH - HUD, "rgba(7,7,13,0.72)");
+const blinkOn = () => mod(frame >> 4, 2) === 0;
+
+function drawTitle() {
+    dim();
+    centered("SKY HOP", HUD + 14, "#ffffff", 24);
+    centered("RUN - CLIMB - SWING", HUD + 46, CLAUDE.body);
+    ctx.save();
+    ctx.translate(VW / 2 - 40, HUD + 58);
+    ctx.scale(2, 2);
+    drawClaude(0, 24, { bob: mod(frame >> 5, 2), eyes: mod(frame, 200) < 8 ? "blink" : "open" });
+    ctx.restore();
+    const lines = ["ARROWS / A D   MOVE", "SPACE  JUMP / LET GO", "W FLAP   S DROP / DOOR", "TAB  CLOCK   M  SOUND"];
+    lines.forEach((line, i) => centered(line, HUD + 122 + i * 14, "#c9c9de"));
+    if (blinkOn()) centered("PRESS SPACE", HUD + 200, "#ffd84a");
+}
+
+function drawOver() {
+    if (clock - deathAt < 0.7) return;
+    dim();
+    centered("GAME OVER", HUD + 60, "#ff4a52", 16);
+    centered(g.cause.toUpperCase(), HUD + 96, "#f4f4f8");
+    centered(`SCORE ${scoreOf(g)}`, HUD + 120, "#ffd84a");
+    if (!g.assisted && scoreOf(g) > 0 && scoreOf(g) >= record) centered("NEW BEST!", HUD + 136, CLAUDE.body);
+    if (!g.auto && blinkOn()) centered("PRESS R TO TRY AGAIN", HUD + 172, "#c9c9de");
+}
+
+function drawBanner() {
+    if (g.phase !== "playing") return;
+    const theme = themeNow();
+    if (g.banner > 0) {
+        rect(0, HUD + 28, VW, 40, "rgba(7,7,13,0.6)");
+        if (g.tunnel !== null) {
+            centered(`${theme.name.toUpperCase()} TUNNEL!`, HUD + 34, blinkOn() ? theme.look.light : "#ffffff", 16);
+            centered("GRAB THE STARS, FIND THE EXIT", HUD + 56, "#c9c9de");
+        } else {
+            centered(`${theme.name.toUpperCase()} ZONE!`, HUD + 34, blinkOn() ? theme.look.light : "#ffffff", 16);
+            centered(`STAGE ${g.stage}: HARDER NOW`, HUD + 56, "#c9c9de");
+        }
+        return;
+    }
+    // a disaster gets its name up for a few seconds as it starts
+    if (sky.disaster && sky.age < 70 && g.tunnel === null) outlined(`${sky.disaster.toUpperCase()}!`, HUD + 36, blinkOn() ? "#ff8a3a" : "#ffe0a0", 16);
+}
+
+// Tab puts up the computer's own time over the game, and the autopilot keeps playing underneath it like a screensaver
+const DAYS = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+const MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+function drawClock() {
+    const now = new Date();
+    const hours = String(now.getHours() % 12 || 12);
+    const minutes = String(now.getMinutes()).padStart(2, "0");
+    const ampm = now.getHours() < 12 ? "AM" : "PM";
+    const theme = themeNow();
+
+    rect(0, 0, VW, VH, "rgba(7,7,13,0.3)");
+
+    // the hours, a colon that blinks each second, the minutes, and AM or PM tucked beside them
+    const big = 40;
+    const y = 72;
+    ctx.font = `${big}px ${FONT}`;
+    const parts = [hours, ":", minutes].map((s) => ({ s, w: ctx.measureText(s).width }));
+    ctx.font = `8px ${FONT}`;
+    const ampmW = ctx.measureText(ampm).width;
+    const total = parts.reduce((sum, p) => sum + p.w, 0) + 6 + ampmW;
+    let x = (VW - total) / 2;
+    const colonOn = now.getSeconds() % 2 === 0;
+    for (const p of parts) {
+        const color = p.s === ":" && !colonOn ? "#3a3a55" : "#ffffff";
+        text(p.s, x + 3, y + 3, INK, big);
+        text(p.s, x, y, color, big);
+        x += p.w;
+    }
+    text(ampm, x + 6, y, theme.look.light);
+
+    const date = `${DAYS[now.getDay()]}  ${MONTHS[now.getMonth()]} ${now.getDate()}  ${now.getFullYear()}`;
+    ctx.font = `8px ${FONT}`;
+    const dateX = (VW - ctx.measureText(date).width) / 2;
+    text(date, dateX + 1, y + 61, INK);
+    text(date, dateX, y + 60, "#ffffff");
+
+    // the minute filling up, one pixel column per second
+    const barW = 120;
+    const barX = (VW - barW) / 2;
+    rect(barX, y + 80, barW, 4, "#1d1d30");
+    rect(barX, y + 80, (barW * (now.getSeconds() + now.getMilliseconds() / 1000)) / 60, 4, theme.look.light);
+}
+
+// ---- one frame ----
+
+let drawnCx = 0;
+let drawnCy = 0;
+function draw(alpha) {
+    clock = performance.now() / 1000;
+    frame = Math.floor(clock * 60);
+    const t = weatherTicks + alpha;
+    // between ticks, everything slides from where it was to where it is; after a restart or a trip through a tunnel
+    // there's nothing to slide from
+    const live = prev && prev.claude === g.claude && g.ticks === prev.ticks + 1 && prev.tunnel === g.tunnel && g.warp < WARP_TICKS - 1;
+    const a = live ? alpha : 1;
+    const lerp = (from, to) => from + (to - from) * a;
+    cam = live ? lerp(prev.cam, g.camera) : g.camera;
+    camX = live ? lerp(prev.camX, g.camX) : g.camX;
+    const xOf = (o) => {
+        const was = live ? prev.xs.get(o) : undefined;
+        return was === undefined || Math.abs(o.x - was) > 4 ? o.x : lerp(was, o.x);
+    };
+    drawnCx = live ? lerp(prev.cx, g.claude.x) : g.claude.x;
+    drawnCy = live ? lerp(prev.cy, g.claude.y) : g.claude.y;
+    const tunnel = tunnelNow();
+    const theme = themeNow();
+    const outside = !tunnel;
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, HUD, VW, VH - HUD);
+    ctx.clip();
+    if (shake > 0.3) ctx.translate(Math.round((Math.random() - 0.5) * shake), Math.round((Math.random() - 0.5) * shake));
+    shake *= 0.88;
+    // an earthquake rocks everything
+    if (outside && sky.disaster === "earthquake" && sky.power > 0.1) {
+        ctx.translate(Math.round(Math.sin(t * 2.3) * 2.5 * sky.power), Math.round(Math.cos(t * 3.1) * 1.5 * sky.power));
+    }
+
+    ctx.drawImage(skyFor(theme), 0, HUD);
+    if (outside) {
+        drawFar();
+        drawWeatherBack(t);
+        drawSkyline(theme, g.stage - 1);
+        drawDisasterLow(t);
+    } else {
+        drawTunnelBack(tunnel, theme);
+    }
+    drawWords(theme);
+    for (const b of g.bolts) if (b.t > BOLT_STRIKE) drawBolt(b);
+    for (const d of g.doors) drawDoor(d);
+    if (tunnel) drawExit(tunnel);
+    for (const p of g.plates) drawPlate(p, xOf(p));
+    for (const r of g.ropes) drawRope(r);
+    for (const s of g.stars) drawStar(s);
+    for (const b of g.birds) drawBug(b, xOf(b));
+
+    if (g.phase === "over") {
+        // knocked out: Claude pops up and drops off the bottom of the screen
+        const since = clock - deathAt;
+        drawClaude(px(deathX), py(deathY) - 90 * since + 320 * since * since, { eyes: "dead", legs: 6 });
+    } else {
+        drawClaude(px(drawnCx), py(drawnCy), claudePose());
+    }
+
+    for (const b of g.bolts) if (b.t <= BOLT_STRIKE) drawBolt(b);
+    for (const p of particles) {
+        ctx.globalAlpha = Math.min(1, p.life / 8);
+        rect(px(p.x), py(p.y) - 2, 2, 2, p.color);
+    }
+    ctx.globalAlpha = 1;
+    if (outside) drawWeatherFront(t);
+    if (tunnel) {
+        // an old screen's scan lines over everything down here
+        for (let y = HUD; y < VH; y += 3) rect(0, y, VW, 1, "rgba(0,0,0,0.22)");
+    }
+    if (outside && thunderNow(t)) rect(0, HUD, VW, VH - HUD, `rgba(235,240,255,${0.3 * (1 - mod(t, THUNDER_EVERY) / 4)})`);
+    if (flash > 0.02) rect(0, HUD, VW, VH - HUD, `rgba(255,255,240,${flash})`);
+    flash *= 0.85;
+    // going down a tunnel or coming back up: a quick fade through black
+    if (g.warp > 0) rect(0, HUD, VW, VH - HUD, `rgba(0,0,0,${Math.min(1, (g.warp - alpha) / (WARP_TICKS / 2))})`);
+    ctx.restore();
+
+    drawHud();
+    if (g.auto) {
+        drawClock();
+        return;
+    }
+    drawBanner();
+    if (g.phase === "title") drawTitle();
+    if (g.phase === "over") drawOver();
+}
+
+// ?debug hands the game to the browser console, for looking at things
+if (params.has("debug")) window.skyHop = g;
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
