@@ -7,7 +7,8 @@ import { HEARTS, HURT_TICKS, MIN_WARN, bossFor } from "./bosses.mjs";
 import { REGROW_TICKS, W, act, input, keysIn, newGame, scoreOf, step } from "./game.mjs";
 import { SMOKE_TICKS, STRIKE_WARNING } from "./hazards.mjs";
 import { ERAS, PLACES, codeFor, eraOf, placeOf } from "./places.mjs";
-import { render } from "./terminal.mjs";
+import { CHARACTERS, CLOTHES, DEFAULT_LOOK, EYEWEAR, HATS, SLOTS, lookFromText, lookToText, randomLook } from "./looks.mjs";
+import { lookRows, render } from "./terminal.mjs";
 import { DISASTERS, WEATHERS, weatherAt } from "./weather.mjs";
 import { buildAhead } from "./world.mjs";
 
@@ -1041,4 +1042,128 @@ test("a fight's frame fits the window, with the boss's name and health on top an
         assert.ok(lines[1].includes(g.fight.boss.name), lines[1]);
         assert.match(lines[0], /<3/);
     }
+});
+
+// ---- characters and clothes ----
+
+test("eleven characters and a wardrobe of hats, eyewear and clothes, each with its letters for the terminal", () => {
+    assert.equal(CHARACTERS.length, 11);
+    for (const slot of SLOTS) {
+        const ids = slot.options.map((o) => o.id);
+        assert.equal(new Set(ids).size, ids.length, `${slot.key} ids are all different`);
+        if (slot.key !== "character") assert.equal(ids[0], "none", `${slot.key} starts with nothing`);
+    }
+    for (const c of CHARACTERS) for (const row of c.ascii) assert.equal(row.length, 5, `${c.name}: ${row}`);
+    for (const h of HATS.slice(1)) assert.equal(h.text.length, 5, h.name);
+    for (const e of EYEWEAR.slice(1)) assert.equal(e.text.length, 3, e.name);
+    for (const c of CLOTHES.slice(1)) assert.equal(c.feet.length, 5, c.name);
+    assert.ok(HATS.some((h) => h.id === "spiky") && HATS.some((h) => h.id === "golden"), "spiky hair, black and gold");
+});
+
+test("C on the title opens the wardrobe: W and S pick a row, A and D change it, X dresses at random, Space closes it", () => {
+    const g = newGame(1);
+    input(g, "c");
+    assert.deepEqual(g.wardrobe, { row: 0 });
+    input(g, "d");
+    assert.equal(g.look.character, "gpt");
+    input(g, "a");
+    input(g, "a");
+    assert.equal(g.look.character, CHARACTERS[CHARACTERS.length - 1].id, "round past the start");
+    input(g, "s");
+    input(g, "d");
+    assert.equal(g.look.hat, HATS[1].id);
+    input(g, "w");
+    input(g, "w");
+    assert.equal(g.wardrobe.row, SLOTS.length - 1, "round past the top row");
+    input(g, "\t");
+    assert.equal(g.auto, false, "Tab does nothing in the wardrobe");
+    input(g, " ");
+    assert.equal(g.wardrobe, null);
+    assert.equal(g.phase, "title", "closing it doesn't start the game");
+    input(g, "c");
+    input(g, "x");
+    input(g, "\r");
+    assert.equal(g.wardrobe, null);
+    input(g, " ");
+    assert.equal(g.phase, "playing");
+    input(g, "c");
+    assert.equal(g.wardrobe, null, "only from the title");
+});
+
+test("a look saves as text and comes back; anything unknown or missing is plain", () => {
+    const look = { character: "openclaw", hat: "golden", eyewear: "3d", clothes: "cape" };
+    assert.deepEqual(lookFromText(lookToText(look)), look);
+    assert.deepEqual(lookFromText("rubbish"), DEFAULT_LOOK);
+    assert.deepEqual(lookFromText(null), DEFAULT_LOOK);
+    assert.deepEqual(lookFromText("grok,party"), { ...DEFAULT_LOOK, character: "grok", hat: "party" });
+    assert.deepEqual(lookFromText("grok,nonsense,round,tie"), { character: "grok", hat: "none", eyewear: "round", clothes: "tie" });
+    let n = 0;
+    const counting = () => (n++ % 7) / 7;
+    const random = randomLook(counting);
+    for (const slot of SLOTS) assert.ok(slot.options.some((o) => o.id === random[slot.key]));
+});
+
+test("the look stays on through a restart", () => {
+    const g = playing();
+    g.look = { character: "llama", hat: "crown", eyewear: "none", clothes: "labcoat" };
+    g.phase = "over";
+    input(g, "r");
+    assert.equal(g.phase, "playing");
+    assert.deepEqual(g.look, { character: "llama", hat: "crown", eyewear: "none", clothes: "labcoat" });
+});
+
+test("it's only looks: a run plays out exactly the same whoever is playing, in whatever they wear", () => {
+    const run = (look) => {
+        const g = playing(2003);
+        g.look = look;
+        g.auto = true;
+        for (let t = 0; t < 1500 && g.phase === "playing"; t++) {
+            autopilot(g);
+            step(g);
+        }
+        return [g.claude.x, g.claude.y, g.stage, scoreOf(g), g.phase];
+    };
+    assert.deepEqual(run({ ...DEFAULT_LOOK }), run({ character: "hugging", hat: "golden", eyewear: "visor", clothes: "cape" }));
+});
+
+test("every character in every hat, eyewear and clothes fits its five letters, in every pose, facing either way", () => {
+    for (const c of CHARACTERS) {
+        for (const hat of HATS) {
+            for (const eyewear of EYEWEAR) {
+                for (const clothes of CLOTHES) {
+                    for (const pose of ["stand", "rope", "up", "down", "over"]) {
+                        for (const dir of [1, -1]) {
+                            const rows = lookRows({ character: c.id, hat: hat.id, eyewear: eyewear.id, clothes: clothes.id }, pose, dir);
+                            for (const row of [rows.hat, rows.head, rows.feet]) {
+                                assert.equal(row.length, 5);
+                                for (const cell of row) if (cell) assert.match(cell[0], /^[\x20-\x7e]$/);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // and whole frames, with each thing worn at least once, plus the wardrobe itself
+    const g = playing();
+    ticks(g, 5);
+    for (let i = 0; i < CHARACTERS.length; i++) {
+        g.look = { character: CHARACTERS[i].id, hat: HATS[i % HATS.length].id, eyewear: EYEWEAR[i % EYEWEAR.length].id, clothes: CLOTHES[i % CLOTHES.length].id };
+        for (const line of render(g, 0).map(strip)) {
+            assert.ok(line.length <= W + 2, line);
+            assert.match(line, /^[\x20-\x7e]*$/);
+        }
+    }
+    const title = newGame(1);
+    input(title, "c");
+    const lines = render(title, 0).map(strip);
+    for (const line of lines) assert.ok(line.length <= W + 2, line);
+    assert.match(lines[1], /Wardrobe/);
+    assert.ok(lines.some((l) => l.includes("> Character")));
+    // the title names whoever's playing, even the longest name
+    const named = newGame(1);
+    named.look = { ...DEFAULT_LOOK, character: "hugging" };
+    const titleLines = render(named, 0).map(strip);
+    for (const line of titleLines) assert.ok(line.length <= W + 2, line);
+    assert.ok(titleLines.some((l) => l.includes("Hugging Face")));
 });

@@ -2,6 +2,7 @@
 // the weather is drawn only into empty cells, so it never hides anything that matters
 import { BOLT_STRIKE, H, W, lapOf, scoreOf, sectionOf } from "./game.mjs";
 import { burning } from "./hazards.mjs";
+import { SLOTS, lookParts } from "./looks.mjs";
 import { codeFor, eraOf, placeOf, themeOf, wordFor } from "./places.mjs";
 
 export const MIN_COLUMNS = W + 2;
@@ -9,7 +10,6 @@ export const MIN_ROWS = H + 6;
 
 // plain plates take their place's colour; the rest keep one colour everywhere, so a hazard looks the same in every place
 const COLORS = { moving: 81, crumble: 180, spring: 213, spike: 196, top: 226 };
-const CLAUDE_COLOR = 209;
 // each world's creature in three letters, two frames to show it moving, and its colour
 const CREATURES = {
     snake: ["~~s", "-~s", 112],
@@ -93,13 +93,44 @@ function plateText(p) {
     return chars;
 }
 
-const claudeLines = (g) => {
+// the character in letters, five across: a hat row, the head and the feet, each a list of [letter, colour] with null
+// where whatever is behind shows through, and a cape's edge trailing behind. pose is "stand", "rope", "up", "down" or
+// "over"; dir is the way it faces
+export function lookRows(look, pose = "stand", dir = 1) {
+    const { character, hat, eyewear, clothes } = lookParts(look);
+    const tint = character.color;
+    const [face, legs] = character.ascii;
+    const eyes = { over: "x x", up: "^ ^", down: "O O" }[pose] ?? face.slice(1, 4);
+    let head = pose === "rope" ? `\\${eyes}/` : `${face[0]}${eyes}${face[4]}`;
+    let feet = { rope: " | | ", up: "'' ''", down: "/| |\\" }[pose] ?? legs;
+    // a gap at either end lets whatever's behind show through; one in the middle is part of the body
+    const row = (text, color, solid = false) => [...text].map((ch, i) => (ch !== " " || (solid && i > 0 && i < 4) ? [ch, color] : null));
+    const headRow = row(head, tint, true);
+    const feetRow = row(feet, tint, true);
+    // eyewear over the eyes, unless knocked out
+    if (eyewear.id !== "none" && pose !== "over") {
+        [...eyewear.text].forEach((ch, i) => (headRow[1 + i] = ch === " " ? headRow[1 + i] : [ch, eyewear.colors?.[i] ?? eyewear.color]));
+    }
+    if (clothes.id !== "none" && pose !== "rope") {
+        [...clothes.feet].forEach((ch, i) => ch !== " " && (feetRow[i] = [ch, clothes.color]));
+        if (clothes.hood) for (const i of [0, 4]) if (headRow[i]) headRow[i] = [headRow[i][0], clothes.color];
+    }
+    let hatRow = [null, null, null, null, null];
+    if (hat.id !== "none") {
+        // a cap's brim points the way it faces
+        const text = dir < 0 ? [...hat.text].reverse().join("").replace(/[\/\\]/g, (c) => (c === "/" ? "\\" : "/")) : hat.text;
+        hatRow = row(text, hat.color);
+    }
+    const behind = clothes.behind && pose !== "rope" ? [dir > 0 ? "<" : ">", clothes.color] : null;
+    return { hat: hatRow, head: headRow, feet: feetRow, behind };
+}
+
+const poseOf = (g) => {
     const { claude } = g;
-    // Claude: a rectangle with two eyes on top of four feet (in five letters its arms don't fit; the 16-bit version has them)
-    if (g.phase === "over") return ["[x x]", "|| ||"];
-    if (claude.rope) return ["\\o o/", " | | "];
-    if (claude.on) return ["[o o]", "|| ||"];
-    return claude.vy > 0 ? ["[^ ^]", "'' ''"] : ["[O O]", "/| |\\"];
+    if (g.phase === "over") return "over";
+    if (claude.rope) return "rope";
+    if (claude.on) return "stand";
+    return claude.vy > 0 ? "up" : "down";
 };
 
 // the weather's mark for an empty cell, if any: rain slants, sand blows sideways, snow drifts, fog hangs about
@@ -211,15 +242,19 @@ function board(g, sky) {
     if (g.fight) drawFight(g, put);
     const feet = Math.round(g.claude.y);
     const cx = Math.round(g.claude.x);
-    const [head, body] = claudeLines(g);
-    const claudeColor = g.phase === "over" ? 196 : CLAUDE_COLOR;
-    // on a rope the corners are empty, and whatever is behind shows through them
-    const solid = (ch, i) => ch !== " " || (i > 0 && i < 4);
+    const me = lookRows(g.look, poseOf(g), g.claude.dir || 1);
+    // knocked out, the whole character goes red
+    const shade = (cell) => (cell && g.phase === "over" ? [cell[0], 196] : cell);
     // just hit in a fight: Claude flashes while it can't be hit again
     const flashing = g.fight && g.fight.hurt > 0 && Math.floor(g.ticks / 2) % 2;
     if (!flashing) {
-        [...head].forEach((ch, i) => solid(ch, i) && put(cx + i, feet + 1, ch, claudeColor));
-        [...body].forEach((ch, i) => solid(ch, i) && put(cx + i, feet, ch, claudeColor));
+        [me.hat, me.head, me.feet].forEach((cells, r) =>
+            cells.forEach((cell, i) => {
+                const c = shade(cell);
+                if (c) put(cx + i, feet + 2 - r, c[0], c[1]);
+            }),
+        );
+        if (me.behind) for (const r of [0, 1]) put(me.behind[0] === "<" ? cx - 1 : cx + 5, feet + r, me.behind[0], me.behind[1]);
     }
     if (g.fight) for (const s of g.fight.shots) put(s.x, Math.round(s.y), "o", 208);
 
@@ -307,7 +342,7 @@ const color = (n) => (n ? `\x1b[38;5;${n}m` : "\x1b[0m");
 
 function statusLines(g, sky) {
     if (g.phase === "title") {
-        return ["SKY HOP: 17 worlds of tech, a boss on each.", "A D move  SPACE jump  W flap  S drop  F fire", "SPACE to start   TAB to watch it play itself"];
+        return ["SKY HOP: 17 worlds of tech, a boss on each.", "A D move  SPACE jump  W flap  S drop  F fire", `SPACE start  TAB watch  C dress ${lookParts(g.look).character.name}`];
     }
     if (g.phase === "over") {
         return ["GAME OVER", g.cause, g.auto ? "" : "Press R to try again, Q to quit."];
@@ -329,7 +364,33 @@ function statusLines(g, sky) {
 
 // one frame of text; sky is the game's own weather unless given (the weather from weather.mjs plus t, the tick it's
 // for), and null for a plain sky
+// the wardrobe: the character big in the middle, and a row for each thing to pick, the chosen row marked
+function wardrobe(g) {
+    const grid = Array.from({ length: H }, () => Array.from({ length: W }, () => [" ", 0]));
+    const write = (row, col, text, color) => [...text].forEach((ch, i) => col + i >= 0 && col + i < W && (grid[row][col + i] = [ch, color]));
+    const middle = (row, text, color) => write(row, Math.floor((W - text.length) / 2), text, color);
+    const parts = lookParts(g.look);
+    middle(1, "Pick who plays, and what they wear.", 250);
+    // the character as it stands, in the middle
+    const left = Math.floor(W / 2) - 2;
+    const me = lookRows(g.look, "stand", 1);
+    [me.hat, me.head, me.feet].forEach((cells, r) => cells.forEach((cell, i) => cell && write(4 + r, left + i, cell[0], cell[1])));
+    if (me.behind) for (const r of [5, 6]) write(r, left - 1, me.behind[0], me.behind[1]);
+    middle(8, parts.character.name, parts.character.color);
+    SLOTS.forEach((slot, i) => {
+        const on = g.wardrobe.row === i;
+        const text = `${on ? ">" : " "} ${slot.name.padEnd(10)} < ${parts[slot.key].name.padEnd(14)} >`;
+        write(11 + i * 2, 4, text, on ? 226 : 245);
+    });
+    return grid;
+}
+
 export function render(g, record = 0, given = undefined) {
+    if (g.wardrobe) {
+        const rows = wardrobe(g).map((cells) => `|${cells.map(([ch, c]) => color(c) + ch).join("")}\x1b[0m|`);
+        const top = `--[ Wardrobe ]${"-".repeat(W - 14)}`;
+        return [" Sky Hop", `+${top}+`, ...rows, `+${"-".repeat(W)}+`, "W S pick a row   A D change it", "X dress at random   SPACE or C done", ""];
+    }
     const sky = given === undefined ? { ...g.sky, t: g.ticks } : given;
     const shownBest = g.assisted ? record : Math.max(record, scoreOf(g));
     const lap = lapOf(g.stage - 1);

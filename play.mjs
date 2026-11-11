@@ -4,6 +4,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 
 import { autopilot } from "./autopilot.mjs";
 import { TICK_MS, input, keysIn, newGame, scoreOf, step } from "./game.mjs";
+import { lookFromText, lookToText } from "./looks.mjs";
 import { MIN_COLUMNS, MIN_ROWS, render } from "./terminal.mjs";
 import { DISASTERS, WEATHERS } from "./weather.mjs";
 
@@ -30,6 +31,24 @@ const args = process.argv.slice(2);
 const startIn = args[0] === "world" ? Math.max(1, Math.floor(Number(args[1])) || 1) : 1;
 const game = newGame(undefined, { world: startIn - 1 });
 const held = args.join(" ").toLowerCase();
+// who's playing and what they wear is kept in look.txt, beside the best score
+const lookFile = new URL("./look.txt", import.meta.url);
+try {
+    game.look = lookFromText(readFileSync(lookFile, "utf8"));
+} catch {
+    // no look saved yet: plain Claude
+}
+let savedLook = lookToText(game.look);
+const saveLook = () => {
+    const text = lookToText(game.look);
+    if (text === savedLook) return;
+    savedLook = text;
+    try {
+        writeFileSync(lookFile, text);
+    } catch {
+        // not saved; the game itself is fine
+    }
+};
 if ([...WEATHERS, ...DISASTERS].includes(held)) game.holdSky = held;
 
 const saveRecord = () => {
@@ -78,9 +97,11 @@ stdin.on("data", (data) => {
             lastTab = now;
             if (repeated) continue;
         }
-        if (key === "q") quit();
+        // in the wardrobe Q is just a key like any other
+        if (key === "q" && !game.wardrobe) quit();
         if (key === "r") saveRecord();
         input(game, key);
+        if (!game.wardrobe) saveLook();
     }
 });
 

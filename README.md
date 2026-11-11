@@ -1,6 +1,6 @@
 # Sky Hop
 
-**Run, climb and swing through 17 worlds of tech, with a little orange Claude.**
+**Run, climb and swing through 17 worlds of tech, as a little orange Claude or one of ten other AI characters.**
 Every platform is a line of code from the world you're in, every world has a creature of its own and a boss guarding its way out, and old-tech tunnels take you under the worst of it, like pipes in a platformer. It never ends: after the seventeenth world you go round again, and everything is tougher. The same game runs as 16-bit pixel art in the browser and as coloured ASCII in a terminal.
 
 ![The title screen](docs/title.png)
@@ -23,14 +23,31 @@ You need [Node.js](https://nodejs.org) 18 or newer. There's nothing to install.
 | `W` or `↑` | Jump, or flap once in mid-air for a little extra height. |
 | `S` or `↓` | Drop through the platform you're on, or **go down a door**. |
 | `F` or `E` | Throw a mini fireball at the boss (only in a boss fight). |
+| `C` | On the title screen, open the **wardrobe** to pick a character and what it wears. |
 | `Tab` | Autopilot. In the browser it also puts the time up over the game, like a screensaver. |
 | `R` | Start again after a game over. |
 | `M` | Sound on or off (browser). |
 | `Q` | Quit (terminal). |
 
-On a phone, the browser version shows on-screen buttons, including **FIRE**. Tapping the game also jumps.
+On a phone, the browser version shows on-screen buttons, including **FIRE** and **STYLE** (the wardrobe). Tapping the game also jumps.
 
 To start further on, in a world of your choice: add `?world=5` to the browser address, or run `node play.mjs world 5`.
+
+## Characters and clothes
+
+Press **`C`** on the title screen to open the **wardrobe**. Pick who plays and dress them up:
+
+- **11 characters**: Claude, GPT, Qwen, Grok, Hugging Face, OpenClaw, Gemini, DeepSeek, Llama, Mistral and Copilot. They're little pixel creatures in each model's colours, not logos, and each has a shape of its own: OpenClaw has claws, DeepSeek has a whale's tail, Llama has ears, Hugging Face holds its hands out for a hug, and Copilot comes in a pilot's cap.
+- **Hats**: cap, top hat, crown, beanie, wizard hat, party hat, propeller cap, and spiky hair in black or glowing gold.
+- **Eyewear**: sunglasses, round glasses, VR visor, monocle, pixel shades, 3D glasses.
+- **Clothes**: tie, bow tie, scarf, hoodie, a cape that flows behind you, and a lab coat.
+
+`W`/`S` picks a row and `A`/`D` changes it (the arrow keys work too, in the browser), `X` dresses you at random, and `Space` is done. It's only looks: every character is the same size and plays exactly the same. Your look is remembered, in the browser's storage or in `look.txt` for the terminal, and it stays on when you restart.
+
+| | |
+| --- | --- |
+| ![The wardrobe](docs/wardrobe.png) | ![All 11 characters, dressed up](docs/characters.png) |
+| The wardrobe | All 11 characters, each in something different |
 
 ## How a run goes
 
@@ -186,10 +203,10 @@ Press **`Tab`** and the game plays itself, and it's good at it. It swings on rop
 ## For developers
 
 ```bash
-node --test test.mjs     # 69 tests, about 30 seconds
+node --test test.mjs     # 75 tests, about 40 seconds
 ```
 
-The tests cover the moves, ropes, doors and tunnels, every kind of creature movement, every dangerous disaster (each one only hurts after its warning), and the wind. For the bosses they cover fireballs, hearts, the arena's walls, every attack's warning on several laps, and each lap getting harder. The autopilot also beats every boss, plays through all 17 worlds and back to the first, and takes every door it comes to.
+The tests cover the moves, ropes, doors and tunnels, every kind of creature movement, every dangerous disaster (each one only hurts after its warning), and the wind. For the bosses they cover fireballs, hearts, the arena's walls, every attack's warning on several laps, and each lap getting harder. For the characters they check every character in every hat, eyewear and clothes fits the terminal, that a look saves and loads, and that a run plays out exactly the same whatever you wear. The autopilot also beats every boss, plays through all 17 worlds and back to the first, and takes every door it comes to.
 
 Add `?debug` to the browser address to get the live game as `window.skyHop` in the console.
 
@@ -201,6 +218,7 @@ Add `?debug` to the browser address to get the live game as `window.skyHop` in t
 | `bosses.mjs` | The boss fights: every boss, its attacks and their warnings, fireballs, hearts, and laps |
 | `weather.mjs` | Which weather and disaster is on at any moment, from a seed |
 | `places.mjs` | The 17 worlds and 5 tunnel eras: their colours, code, words and creatures |
+| `looks.mjs` | The characters, hats, eyewear and clothes, and the wardrobe that picks them |
 | `autopilot.mjs` | The autopilot: it tries out its moves ahead of time on a copy of the game |
 | `index.html` | The 16-bit browser version: pixel art, sound and the clock |
 | `terminal.mjs`, `play.mjs` | The ASCII version and its launcher |

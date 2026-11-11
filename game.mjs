@@ -3,6 +3,7 @@
 // heights count up from the first plate; a plate at y holds Claude, whose feet are at y + 1. x is in cells across the
 // whole world, and the window is W cells of it, wherever the camera is
 import { holdIn, lapOf, moveFight, shoot, startFight } from "./bosses.mjs";
+import { dress, newLook } from "./looks.mjs";
 import { hazardDanger, moveHazards, skySeedOf, updateSky, windPush, windSwing } from "./hazards.mjs";
 import { ASPECT, BODY_W, CRUMBLE_TICKS, H, W, buildAhead, clamp, digTunnel, progressOf, safeCenter, sectionOf, startWorld, tidy, tunnelExit, whole } from "./world.mjs";
 
@@ -81,6 +82,9 @@ export function newGame(seed = Date.now() | 0, { hazards = true, world = 0 } = {
         beaten: null,
         // crumbled plates waiting to grow back
         regrow: [],
+        // who's playing and what they're wearing (see looks.mjs), and the wardrobe while it's open: only looks
+        look: newLook(),
+        wardrobe: null,
         claude: { x: 2, y: 1, vy: 0, vx: 0, on: null, dir: 0, left: 0, want: 0, fluttered: false, rope: null, cool: 0, lastRope: -1, moved: 0 },
     };
     updateSky(g);
@@ -143,8 +147,8 @@ function jump(claude) {
 }
 
 export const restart = (g) => {
-    const { auto, holdSky } = g;
-    Object.assign(g, newGame(g.seed, { hazards: g.hazards, world: g.startWorld }), { phase: "playing", auto, assisted: auto, holdSky });
+    const { auto, holdSky, look } = g;
+    Object.assign(g, newGame(g.seed, { hazards: g.hazards, world: g.startWorld }), { phase: "playing", auto, assisted: auto, holdSky, look });
 };
 
 // the door Claude is standing in, if any
@@ -289,6 +293,11 @@ function checkTunnelExit(g) {
 // one key press; the terminal's own escape codes (arrow keys and such) never reach here, see keysIn
 // Tab hands Claude to the autopilot and back; a run it has touched doesn't count towards the best score
 export function input(g, key) {
+    // while the wardrobe is open every key goes to it
+    if (g.wardrobe) {
+        dress(g, key);
+        return;
+    }
     if (key === "\t") {
         g.auto = !g.auto;
         if (g.auto) g.assisted = true;
@@ -300,6 +309,7 @@ export function input(g, key) {
         return;
     }
     if (g.phase === "title") {
+        if (key === "c") g.wardrobe = { row: 0 };
         if (key === " " || key === "\r") g.phase = "playing";
         return;
     }

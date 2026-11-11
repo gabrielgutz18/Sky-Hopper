@@ -12,24 +12,25 @@
     html, body { margin: 0; height: 100%; background: #07070d; }
     body { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; overflow: hidden; touch-action: none; }
     canvas { display: block; image-rendering: pixelated; image-rendering: crisp-edges; }
-    .pad { display: none; gap: 8px; }
+    .pad { display: none; gap: 6px; }
     @media (pointer: coarse) { .pad { display: flex; } }
     .pad button {
-        font: 11px "Press Start 2P", monospace; color: #f4f4f8; background: #1d1d30;
-        border: 2px solid #44446a; border-radius: 6px; min-width: 50px; min-height: 56px;
+        font: 10px "Press Start 2P", monospace; color: #f4f4f8; background: #1d1d30;
+        border: 2px solid #44446a; border-radius: 6px; min-width: 42px; min-height: 56px;
         touch-action: none; user-select: none; -webkit-user-select: none;
     }
     .pad button:active { background: #36365a; }
 </style>
 </head>
 <body>
-<canvas id="screen" aria-label="Sky Hop. Arrow keys or A and D to move, Space to jump and to let go of a rope, S to go down a tunnel door, F to throw fireballs at a boss."></canvas>
+<canvas id="screen" aria-label="Sky Hop. Arrow keys or A and D to move, Space to jump and to let go of a rope, S to go down a tunnel door, F to throw fireballs at a boss, C on the title screen to pick a character and clothes."></canvas>
 <div class="pad">
     <button data-key="a" aria-label="Move left">&lt;</button>
     <button data-key=" ">JUMP</button>
     <button data-key="w">FLAP</button>
     <button data-key="s" aria-label="Drop, or go into a door">DOWN</button>
     <button data-key="f" aria-label="Throw a fireball at the boss">FIRE</button>
+    <button data-key="c" aria-label="Pick a character and clothes">STYLE</button>
     <button data-key="d" aria-label="Move right">&gt;</button>
 </div>
 <script type="module">
@@ -38,6 +39,7 @@
 import { autopilot } from "./autopilot.mjs";
 import { BOLT_STRIKE, CRUMBLE_TICKS, H, HANDS, TICK_MS, W, WARP_TICKS, doorAt, input, lapOf, newGame, scoreOf, sectionOf, step } from "./game.mjs";
 import { STRIKE_WARNING, updateSky } from "./hazards.mjs";
+import { CHARACTERS, SLOTS, lookFromText, lookParts, lookToText } from "./looks.mjs";
 import { codeLine, eraOf, placeOf, themeOf, wordFor } from "./places.mjs";
 import { DISASTERS, WEATHERS } from "./weather.mjs";
 
@@ -100,6 +102,21 @@ const params = new URLSearchParams(location.search);
 // ?world=5 starts in the fifth world, for a look at it and its boss
 const g = newGame(undefined, { world: Math.max(0, Math.floor(Number(params.get("world")) || 1) - 1) });
 
+// who's playing and what they wear, kept in this browser
+const LOOK_KEY = "sky-hop-look";
+try {
+    g.look = lookFromText(localStorage.getItem(LOOK_KEY));
+} catch {
+    // nothing saved, or no storage here: plain Claude
+}
+const saveLook = () => {
+    try {
+        localStorage.setItem(LOOK_KEY, lookToText(g.look));
+    } catch {
+        // not saved, but kept for this visit
+    }
+};
+
 const saveBest = () => {
     if (g.assisted || scoreOf(g) <= record) return;
     record = scoreOf(g);
@@ -114,6 +131,12 @@ const saveBest = () => {
 const held = [];
 const press = (key) => {
     wakeAudio();
+    // the wardrobe takes one step per press, never a held key
+    if (g.wardrobe || (key === "c" && g.phase === "title")) {
+        input(g, key);
+        if (!g.wardrobe) saveLook();
+        return;
+    }
     if (key === "a" || key === "d") {
         if (!held.includes(key)) held.push(key);
         input(g, key);
@@ -136,7 +159,7 @@ const release = (key) => {
 const KEYS = {
     ArrowLeft: "a", KeyA: "a", ArrowRight: "d", KeyD: "d",
     Space: " ", ArrowUp: "w", KeyW: "w", ArrowDown: "s", KeyS: "s",
-    Enter: "\r", Tab: "\t", KeyR: "r", KeyM: "m", KeyF: "f", KeyE: "e",
+    Enter: "\r", Tab: "\t", KeyR: "r", KeyM: "m", KeyF: "f", KeyE: "e", KeyC: "c", KeyX: "x", Escape: "\x1b",
 };
 addEventListener("keydown", (e) => {
     const key = KEYS[e.code];
@@ -366,7 +389,7 @@ function snapshot() {
 }
 
 function tick() {
-    if (held.length && !g.auto) input(g, held[held.length - 1]);
+    if (held.length && !g.auto && !g.wardrobe) input(g, held[held.length - 1]);
     prev = snapshot();
     const f = g.fight;
     const before = { on: g.claude.on, rope: g.claude.rope, vy: g.claude.vy, bonus: g.bonus, phase: g.phase, stage: g.stage, tunnel: g.tunnel, fight: !!f, shots: f?.shots.length ?? 0, hp: f?.boss.hp ?? 0, hearts: f?.hearts ?? 0, dying: f?.boss.dying ?? 0 };
@@ -779,58 +802,419 @@ function drawBolt(b) {
 }
 
 // Claude: an orange rectangle with two eyes, two arms out to the sides (or up, on a rope) and four feet
-function drawClaude(x, bottom, pose = {}) {
-    const { legs = 5, armDy = 0, bob = 0, stride = -1, eyes = "open", look = 0, armsUp = false } = pose;
-    const bx = x + 6;
-    const bw = 28;
-    const bh = 14;
-    const top = bottom - legs - bh + bob;
-    [3, 9, 16, 22].forEach((lx, i) => {
-        const lift = stride >= 0 && i % 2 === stride ? 2 : 0;
-        const lh = bottom - lift - (top + bh);
-        rect(bx + lx - 1, top + bh, 5, lh + 1, CLAUDE.ink);
-        rect(bx + lx, top + bh, 3, lh, CLAUDE.shade);
-    });
-    if (armsUp) {
-        // both hands up on the rope, over the middle of the head
-        rect(bx + 8, top - 9, 5, 10, CLAUDE.ink);
-        rect(bx + 9, top - 8, 3, 9, CLAUDE.body);
-        rect(bx + 15, top - 9, 5, 10, CLAUDE.ink);
-        rect(bx + 16, top - 8, 3, 9, CLAUDE.body);
-    } else {
-        const ay = top + 5 + armDy;
-        rect(bx - 6, ay - 1, 7, 6, CLAUDE.ink);
-        rect(bx - 5, ay, 5, 4, CLAUDE.body);
-        rect(bx + bw - 1, ay - 1, 7, 6, CLAUDE.ink);
-        rect(bx + bw, ay, 5, 4, CLAUDE.body);
+// ---- the characters, and what they wear ----
+
+// each character in pixels: its colours, its body's shape, its eyes, arms and legs, and anything of its own. they all
+// fill the same box as Claude, so a hat, glasses or a tie sits in the same place on every one of them
+const CHARS = {
+    claude: { body: "#d97757", light: "#eda183", shade: "#b0573a", ink: "#2b1209", eye: "#141414", round: 0, eyes: "tall", arms: "nub", legs: 4 },
+    gpt: { body: "#2b2f36", light: "#4a515c", shade: "#1a1d22", ink: "#0a0b0d", eye: "#7df2c8", round: 3, eyes: "round", arms: "nub", legs: 4, extra: "smile", accent: "#10a37f" },
+    qwen: { body: "#7b5cff", light: "#a48cff", shade: "#5a3fd6", ink: "#1e1050", eye: "#ffffff", round: 5, eyes: "round", arms: "nub", legs: 2, extra: "sprout", accent: "#5be38a" },
+    grok: { body: "#16161a", light: "#3a3a42", shade: "#050507", ink: "#e8e8ee", eye: "#f4f4f8", round: 0, eyes: "smug", arms: "nub", legs: 4 },
+    hugging: { body: "#ffd21e", light: "#ffe36e", shade: "#e0a800", ink: "#5a3a00", eye: "#3a2400", round: 6, eyes: "happy", arms: "hands", legs: 2, extra: "grin", accent: "#ff8a5a" },
+    openclaw: { body: "#e0352b", light: "#ff6a5a", shade: "#a8201a", ink: "#3a0806", eye: "#141414", round: 3, eyes: "stalk", arms: "claws", legs: 4, extra: "feelers" },
+    gemini: { body: "#4c7cf3", light: "#8ab0ff", shade: "#3058c8", ink: "#101a40", eye: "#ffffff", round: 3, eyes: "round", arms: "nub", legs: 4, extra: "twins", fade: "#9b5cf0", accent: "#ffe27a" },
+    deepseek: { body: "#4d6bfe", light: "#8ea0ff", shade: "#2f48c8", ink: "#0c1550", eye: "#141414", round: 5, eyes: "round", arms: "fin", legs: 2, extra: "whale" },
+    llama: { body: "#f1e3c8", light: "#fff6e4", shade: "#cdb48a", ink: "#5a4630", eye: "#2a1c0e", round: 2, eyes: "tall", arms: "nub", legs: 4, extra: "ears", accent: "#d9a7a0" },
+    mistral: { body: "#ff8205", light: "#ffd800", shade: "#e10500", ink: "#3a1200", eye: "#141414", round: 0, eyes: "tall", arms: "nub", legs: 4, extra: "stripes", stripes: ["#ffd800", "#ffaf00", "#ff8205", "#fa500f", "#e10500"] },
+    copilot: { body: "#1aa0b8", light: "#5fd3e6", shade: "#0d6f82", ink: "#06303a", eye: "#ffffff", round: 3, eyes: "round", arms: "nub", legs: 4, extra: "pilot" },
+};
+
+// a box with its corners rounded off by r pixels, row by row
+function roundBox(x, y, w, h, r, color) {
+    for (let row = 0; row < h; row++) {
+        const fromEdge = Math.min(row, h - 1 - row);
+        const cut = fromEdge >= r ? 0 : Math.round(r - Math.sqrt(r * r - (r - fromEdge - 0.5) ** 2));
+        rect(x + cut, y + row, w - cut * 2, 1, color);
     }
-    rect(bx - 1, top - 1, bw + 2, bh + 2, CLAUDE.ink);
-    rect(bx, top, bw, bh, CLAUDE.body);
-    rect(bx, top, bw, 1, CLAUDE.light);
-    rect(bx, top + bh - 2, bw, 2, CLAUDE.shade);
-    rect(bx + bw - 1, top, 1, bh, CLAUDE.shade);
-    for (const ex of [bx + 7 + look, bx + 18 + look]) {
-        const ey = top + 4;
-        if (eyes === "dead") {
-            for (let i = 0; i < 4; i++) {
-                rect(ex + i - 1, ey + i, 1, 1, CLAUDE.eye);
-                rect(ex + 2 - i, ey + i, 1, 1, CLAUDE.eye);
+}
+
+// a little cone from a point down to a base, for hats and spikes
+function cone(cx, tipY, baseY, half, color, lean = 0) {
+    const h = baseY - tipY;
+    for (let k = 0; k <= h; k++) {
+        const w = Math.max(1, Math.round((half * 2 * k) / h));
+        rect(cx - w / 2 + lean * (1 - k / h), tipY + k, w, 1, color);
+    }
+}
+
+function drawCape(bx, top, bottom, dir, moving) {
+    const flutter = moving ? Math.sin(frame / 4) * 2 : 0;
+    const back = dir > 0 ? bx - 2 : bx + 30;
+    for (let k = 0; k < bottom - top - 1; k++) {
+        const spread = 3 + k * 0.45 + (k > 4 ? flutter * (k / 20) : 0);
+        const x = dir > 0 ? back - spread : back;
+        rect(x - 1, top + 2 + k, spread + 2, 1, "#4a0a0a");
+        rect(x, top + 2 + k, spread, 1, k % 6 < 3 ? "#c62828" : "#b01e1e");
+    }
+}
+
+function drawHat(id, cx, ty, dir, bx, bw) {
+    const ink = INK;
+    if (id === "cap") {
+        roundBox(cx - 13, ty - 7, 26, 8, 4, ink);
+        roundBox(cx - 12, ty - 6, 24, 7, 4, "#2b6fd6");
+        rect(cx - 12, ty - 5, 24, 1, "#5a96f0");
+        rect(dir > 0 ? cx + 6 : cx - 19, ty - 2, 13, 3, ink);
+        rect(dir > 0 ? cx + 7 : cx - 18, ty - 1, 11, 1, "#1d4fa0");
+        rect(cx - 1, ty - 8, 3, 2, "#1d4fa0");
+    } else if (id === "tophat") {
+        rect(cx - 15, ty - 4, 30, 4, ink);
+        rect(cx - 14, ty - 3, 28, 2, "#2a2a32");
+        rect(cx - 10, ty - 17, 20, 14, ink);
+        rect(cx - 9, ty - 16, 18, 13, "#2a2a32");
+        rect(cx - 9, ty - 16, 2, 13, "#44444f");
+        rect(cx - 9, ty - 7, 18, 3, "#b0202a");
+    } else if (id === "crown") {
+        rect(cx - 12, ty - 6, 24, 6, ink);
+        rect(cx - 11, ty - 5, 22, 4, "#f2c230");
+        for (const px of [-10, -1, 8]) {
+            rect(cx + px - 1, ty - 12, 5, 7, ink);
+            rect(cx + px, ty - 11, 3, 6, "#f2c230");
+        }
+        rect(cx - 9, ty - 4, 2, 2, "#e8303a");
+        rect(cx, ty - 4, 2, 2, "#2f7bff");
+        rect(cx + 8, ty - 4, 2, 2, "#3fcf52");
+        rect(cx - 11, ty - 5, 22, 1, "#fff0a0");
+    } else if (id === "beanie") {
+        roundBox(cx - 14, ty - 10, 28, 11, 6, ink);
+        roundBox(cx - 13, ty - 9, 26, 10, 6, "#c2185b");
+        for (let k = cx - 11; k < cx + 12; k += 4) rect(k, ty - 8, 1, 6, "#e04a86");
+        rect(cx - 14, ty - 3, 28, 4, ink);
+        rect(cx - 13, ty - 2, 26, 2, "#8e1043");
+        rect(cx - 3, ty - 14, 7, 6, ink);
+        rect(cx - 2, ty - 13, 5, 4, "#ffffff");
+    } else if (id === "wizard") {
+        cone(cx, ty - 22, ty - 2, 12, ink, -dir * 5);
+        cone(cx, ty - 21, ty - 3, 11, "#3d3dbd", -dir * 5);
+        rect(cx - 16, ty - 3, 32, 3, ink);
+        rect(cx - 15, ty - 2, 30, 1, "#2a2a90");
+        for (const [sx, sy] of [[-4, -7], [3, -12], [-1, -16]]) rect(cx + sx, ty + sy, 2, 2, "#ffe27a");
+    } else if (id === "party") {
+        for (let k = 0; k < 16; k++) {
+            const w = Math.max(1, Math.round(k * 1.1));
+            rect(cx - w / 2 - 1, ty - 17 + k, w + 2, 1, ink);
+            rect(cx - w / 2, ty - 17 + k, w, 1, mod(k, 4) < 2 ? "#ff5aa8" : "#ffe27a");
+        }
+        rect(cx - 2, ty - 21, 5, 5, "#5ad1ff");
+    } else if (id === "propeller") {
+        roundBox(cx - 13, ty - 7, 26, 8, 4, ink);
+        roundBox(cx - 12, ty - 6, 12, 7, 4, "#e8303a");
+        roundBox(cx, ty - 6, 12, 7, 4, "#2f7bff");
+        rect(cx - 12, ty - 2, 24, 2, "#ffd83a");
+        rect(cx - 1, ty - 11, 2, 5, ink);
+        const spin = Math.round(Math.abs(Math.cos(frame / 3)) * 11) + 1;
+        rect(cx - spin, ty - 12, spin * 2, 2, "#ffd83a");
+        rect(cx - spin, ty - 12, spin * 2, 1, "#fff3a0");
+    } else if (id === "spiky" || id === "golden") {
+        const gold = id === "golden";
+        const hair = gold ? "#ffd83a" : "#1d1d26";
+        const lit = gold ? "#fff3a0" : "#4a4a5c";
+        // big spikes sweeping up and out, and two hanging down at the sides
+        const spikes = [[-17, 9, -9], [-10, 16, -5], [-2, 20, -1], [6, 17, 4], [13, 11, 8]];
+        for (const [sx, h, lean] of spikes) cone(cx + sx + 2, ty - h - 1, ty + 1, 7, INK, lean);
+        for (const [sx, h, lean] of spikes) cone(cx + sx + 2, ty - h, ty, 6, hair, lean);
+        for (const side of [-1, 1]) {
+            const hx = side < 0 ? bx - 4 : bx + bw - 2;
+            rect(hx - 1, ty - 2, 7, 9, INK);
+            rect(hx, ty - 1, 5, 7, hair);
+        }
+        rect(bx - 3, ty - 3, bw + 6, 5, INK);
+        rect(bx - 2, ty - 2, bw + 4, 4, hair);
+        for (const [sx, h, lean] of spikes) rect(cx + sx + 1 + lean * 0.5, ty - h + 5, 2, 4, lit);
+        // the golden kind crackles with sparks
+        if (gold) {
+            for (let k = 0; k < 6; k++) {
+                const r = hash(k * 31 + (frame >> 2));
+                if (r < 0.5) continue;
+                const sx = bx - 8 + hash(k * 17 + (frame >> 2)) * (bw + 16);
+                const sy = ty - 20 + hash(k * 7 + (frame >> 2)) * 34;
+                rect(sx, sy, 2, 2, "#fff3a0");
+                rect(sx - 2, sy + 0.5, 6, 1, "rgba(255,230,90,0.6)");
             }
-        } else if (eyes === "blink") {
-            rect(ex, ey + 3, 3, 1, CLAUDE.eye);
-        } else if (eyes === "happy") {
-            rect(ex, ey + 2, 1, 2, CLAUDE.eye);
-            rect(ex + 1, ey + 1, 1, 1, CLAUDE.eye);
-            rect(ex + 2, ey + 2, 1, 2, CLAUDE.eye);
-        } else {
-            const tall = eyes === "wide" ? 6 : 5;
-            rect(ex, ey - (tall - 5), 3, tall, CLAUDE.eye);
-            rect(ex, ey - (tall - 5), 1, 1, "#ffffff");
         }
     }
 }
 
+function drawEyewear(id, ex0, ex1, ey, bx, bw) {
+    if (id === "sunglasses") {
+        for (const ex of [ex0, ex1]) {
+            rect(ex - 2, ey - 1, 8, 6, INK);
+            rect(ex - 1, ey, 6, 4, "#1c1c24");
+            rect(ex, ey, 2, 1, "#8a8aa0");
+        }
+        rect(ex0 + 6, ey, ex1 - ex0 - 8, 1, INK);
+        rect(bx, ey, ex0 - 2 - bx, 1, INK);
+        rect(ex1 + 6, ey, bx + bw - ex1 - 6, 1, INK);
+    } else if (id === "round") {
+        for (const ex of [ex0, ex1]) {
+            rect(ex - 3, ey - 2, 9, 1, "#2a2a33");
+            rect(ex - 3, ey + 6, 9, 1, "#2a2a33");
+            rect(ex - 3, ey - 1, 1, 7, "#2a2a33");
+            rect(ex + 5, ey - 1, 1, 7, "#2a2a33");
+            ctx.globalAlpha = 0.25;
+            rect(ex - 2, ey - 1, 7, 7, "#d8f6ff");
+            ctx.globalAlpha = 1;
+        }
+        rect(ex0 + 6, ey + 1, ex1 - ex0 - 9, 1, "#2a2a33");
+    } else if (id === "visor") {
+        rect(bx - 2, ey - 3, bw + 4, 9, INK);
+        rect(bx - 1, ey - 2, bw + 2, 7, "#13a9c2");
+        rect(bx - 1, ey - 2, bw + 2, 2, "#5fe8ff");
+        rect(bx + 2 + mod(frame >> 2, bw - 6), ey + 1, 3, 1, "#d8fbff");
+    } else if (id === "monocle") {
+        rect(ex1 - 3, ey - 2, 9, 1, "#f0c040");
+        rect(ex1 - 3, ey + 6, 9, 1, "#f0c040");
+        rect(ex1 - 3, ey - 1, 1, 7, "#f0c040");
+        rect(ex1 + 5, ey - 1, 1, 7, "#f0c040");
+        for (let k = 0; k < 7; k++) rect(ex1 + 5 + (k % 2), ey + 7 + k, 1, 1, "#f0c040");
+    } else if (id === "pixel") {
+        rect(ex0 - 4, ey - 1, ex1 - ex0 + 11, 2, INK);
+        for (const ex of [ex0, ex1]) {
+            rect(ex - 2, ey + 1, 7, 2, INK);
+            rect(ex - 1, ey + 3, 5, 2, INK);
+            rect(ex, ey + 1, 1, 1, "#ffffff");
+            rect(ex + 1, ey + 2, 1, 1, "#ffffff");
+        }
+    } else if (id === "3d") {
+        for (const [ex, lens] of [[ex0, "#e8303a"], [ex1, "#2f7bff"]]) {
+            rect(ex - 3, ey - 2, 9, 8, "#f4f4f8");
+            rect(ex - 2, ey - 1, 7, 6, lens);
+        }
+        rect(ex0 + 6, ey, ex1 - ex0 - 9, 2, "#f4f4f8");
+    }
+}
+
+function drawClothes(id, bx, bw, top, bh, bottom) {
+    const cx = bx + bw / 2;
+    if (id === "tie") {
+        rect(cx - 3, top + bh - 6, 6, 4, INK);
+        rect(cx - 2, top + bh - 5, 4, 2, "#d02030");
+        for (let k = 0; k < bottom - (top + bh) + 3; k++) {
+            const w = k > bottom - (top + bh) ? 2 : 4;
+            rect(cx - w / 2 - 1, top + bh - 2 + k, w + 2, 1, INK);
+            rect(cx - w / 2, top + bh - 2 + k, w, 1, k % 3 ? "#d02030" : "#a01422");
+        }
+    } else if (id === "bowtie") {
+        const y = top + bh - 6;
+        rect(cx - 8, y - 1, 16, 7, INK);
+        rect(cx - 7, y, 5, 5, "#d81b9a");
+        rect(cx + 2, y, 5, 5, "#d81b9a");
+        rect(cx - 2, y + 1, 4, 3, "#ff6ad0");
+    } else if (id === "scarf") {
+        rect(bx - 2, top + bh - 5, bw + 4, 6, INK);
+        rect(bx - 1, top + bh - 4, bw + 2, 4, "#2a8cf0");
+        for (let k = bx + 1; k < bx + bw; k += 5) rect(k, top + bh - 4, 2, 4, "#e8f2ff");
+        const sway = Math.round(Math.sin(frame / 6) * 2);
+        rect(bx + bw - 7 + sway, top + bh, 6, 7, INK);
+        rect(bx + bw - 6 + sway, top + bh, 4, 6, "#2a8cf0");
+    } else if (id === "hoodie") {
+        const hood = "#5b5bd6";
+        rect(bx - 4, top - 4, bw + 8, 5, INK);
+        rect(bx - 4, top - 4, 5, bh + 5, INK);
+        rect(bx + bw - 1, top - 4, 5, bh + 5, INK);
+        rect(bx - 3, top - 3, bw + 6, 3, hood);
+        rect(bx - 3, top - 3, 3, bh + 3, hood);
+        rect(bx + bw, top - 3, 3, bh + 3, hood);
+        rect(bx - 3, top - 3, bw + 6, 1, "#8484f0");
+        rect(cx - 5, top + bh - 1, 1, 4, "#f4f4f8");
+        rect(cx + 4, top + bh - 1, 1, 4, "#f4f4f8");
+    } else if (id === "labcoat") {
+        for (const x of [bx - 1, bx + bw - 8]) {
+            rect(x, top + bh - 8, 9, 9, INK);
+            rect(x + 1, top + bh - 7, 7, 7, "#f4f4f8");
+        }
+        rect(bx + 6, top + bh - 7, 1, 7, "#b8b8c8");
+        rect(bx + bw - 7, top + bh - 7, 1, 7, "#b8b8c8");
+        rect(bx + bw - 6, top + bh - 6, 3, 1, "#2f7bff");
+    }
+}
+
+// a character where it stands: x is the left of its box and bottom the line its feet are on. the pose (from claudePose)
+// says how it stands; look is what it is and wears, the player's own unless given
+function drawClaude(x, bottom, pose = {}, look = g.look) {
+    const { legs = 5, armDy = 0, bob = 0, stride = -1, eyes = "open", look: glance = 0, armsUp = false, dir = 1, moving = false } = pose;
+    const parts = lookParts(look);
+    const c = CHARS[parts.character.id] ?? CHARS.claude;
+    const coat = parts.clothes.id === "labcoat";
+    const bx = x + 6;
+    const bw = 28;
+    const bh = 14;
+    const top = bottom - legs - bh + bob;
+    const cx = bx + bw / 2;
+
+    if (parts.clothes.id === "cape") drawCape(bx, top, bottom, dir, moving);
+    // a whale's tail, behind
+    if (c.extra === "whale") {
+        const tx = dir > 0 ? bx - 7 : bx + bw + 1;
+        const flick = mod(frame >> 4, 2);
+        rect(tx - 1, top + 3 - flick, 8, 7, c.ink);
+        rect(tx, top + 4 - flick, 6, 5, c.shade);
+    }
+    // a llama's ears, behind its head
+    if (c.extra === "ears") {
+        for (const ex of [bx + 3, bx + bw - 8]) {
+            rect(ex - 1, top - 8, 7, 10, c.ink);
+            rect(ex, top - 7, 5, 9, c.body);
+            rect(ex + 2, top - 5, 1, 5, c.accent);
+        }
+    }
+    // a lobster's feelers
+    if (c.extra === "feelers") {
+        for (let k = 0; k < 10; k++) {
+            rect(bx + 4 - k * 0.8, top - 2 - k, 1, 1, c.shade);
+            rect(bx + bw - 5 + k * 0.8, top - 2 - k, 1, 1, c.shade);
+        }
+    }
+
+    // legs: four short ones, or two for the rounder characters
+    const legXs = c.legs === 2 ? [6, 18] : [3, 9, 16, 22];
+    legXs.forEach((lx, i) => {
+        const lift = stride >= 0 && i % 2 === stride ? 2 : 0;
+        const lh = bottom - lift - (top + bh);
+        rect(bx + lx - 1, top + bh, 5, lh + 1, c.ink === "#e8e8ee" ? "#2a2a30" : c.ink);
+        rect(bx + lx, top + bh, 3, lh, coat ? "#f4f4f8" : c.shade);
+    });
+
+    // arms: little nubs, claws, open hands, or fins; up on a rope
+    const arm = coat ? "#f4f4f8" : c.body;
+    if (armsUp) {
+        for (const ax of [bx + 8, bx + 15]) {
+            rect(ax, top - 9, 5, 10, c.ink);
+            rect(ax + 1, top - 8, 3, 9, arm);
+        }
+        if (c.arms === "claws") for (const ax of [bx + 6, bx + 15]) {
+            rect(ax, top - 13, 8, 5, c.ink);
+            rect(ax + 1, top - 12, 6, 3, c.body);
+            rect(ax + 3, top - 12, 2, 2, c.ink);
+        }
+    } else {
+        const ay = top + 5 + armDy;
+        for (const side of [-1, 1]) {
+            const ax = side < 0 ? bx - 6 : bx + bw - 1;
+            if (c.arms === "claws") {
+                const kx = side < 0 ? bx - 10 : bx + bw - 1;
+                rect(kx, ay - 4, 11, 10, c.ink);
+                rect(kx + 1, ay - 3, 9, 8, c.body);
+                rect(kx + 1, ay - 3, 9, 2, c.light);
+                rect(kx + (side < 0 ? 1 : 5), ay - 1, 4, 2, c.ink);
+            } else if (c.arms === "hands") {
+                // open hands out front, ready for a hug
+                const hx = side < 0 ? bx - 8 : bx + bw - 1;
+                rect(hx, ay - 1, 9, 8, c.ink);
+                rect(hx + 1, ay, 7, 6, arm);
+                for (let f = 0; f < 3; f++) rect(hx + 1 + f * 2 + (side < 0 ? 0 : 1), ay - 3, 1, 3, c.ink);
+            } else if (c.arms === "fin") {
+                rect(ax, ay + 1, 7, 4, c.ink);
+                rect(ax + 1, ay + 2, 5, 2, c.shade);
+            } else {
+                rect(ax, ay - 1, 7, 6, c.ink);
+                rect(ax + 1, ay, 5, 4, arm);
+            }
+        }
+    }
+
+    // the body, which is the face too
+    roundBox(bx - 1, top - 1, bw + 2, bh + 2, c.round + 1, c.ink);
+    roundBox(bx, top, bw, bh, c.round, c.body);
+    if (c.extra === "stripes") {
+        c.stripes.forEach((s, i) => rect(bx, top + 1 + i * 3, bw, 3, s));
+        rect(bx, top, bw, 1, c.stripes[0]);
+    } else if (c.fade) {
+        for (let k = 0; k < bw; k += 2) {
+            ctx.globalAlpha = (k / bw) * 0.85;
+            rect(bx + k, top + 1, 2, bh - 2, c.fade);
+        }
+        ctx.globalAlpha = 1;
+    } else {
+        rect(bx + c.round, top, bw - c.round * 2, 1, c.light);
+        rect(bx + c.round, top + bh - 2, bw - c.round * 2, 2, c.shade);
+        rect(bx + bw - 1, top + c.round, 1, bh - c.round * 2, c.shade);
+    }
+    if (c.extra === "whale") rect(bx + 6, top + bh - 4, bw - 12, 3, "#e8eeff");
+    if (c.extra === "smile") rect(cx - 4, top + 11, 8, 1, c.accent);
+    if (c.extra === "grin") {
+        rect(cx - 5, top + 9, 10, 1, c.ink);
+        rect(cx - 4, top + 10, 8, 2, c.ink);
+        rect(cx - 3, top + 11, 6, 1, c.accent);
+    }
+    if (c.extra === "sprout") {
+        rect(cx, top - 5, 1, 5, c.ink);
+        rect(cx - 3, top - 7, 4, 2, c.accent);
+        rect(cx + 1, top - 6, 4, 2, c.accent);
+    }
+    if (c.extra === "twins") {
+        for (const ax of [cx - 7, cx + 6]) {
+            rect(ax, top - 5, 1, 5, c.ink);
+            rect(ax - 1, top - 8, 3, 3, c.accent);
+        }
+    }
+    if (c.extra === "ears") {
+        rect(cx - 4, top + 9, 8, 4, c.light);
+        rect(cx - 2, top + 10, 1, 1, c.ink);
+        rect(cx + 1, top + 10, 1, 1, c.ink);
+    }
+
+    // eyes: each character's own when they're plain open, and the same blink, wide eyes, smile and knock-out for all
+    const stalks = c.eyes === "stalk";
+    const ey = stalks ? top - 6 : top + 4;
+    const ex0 = bx + 7 + glance;
+    const ex1 = bx + 18 + glance;
+    for (const ex of [ex0, ex1]) {
+        if (stalks) {
+            rect(ex + 1, top - 2, 1, 3, c.ink);
+            rect(ex - 1, ey - 1, 6, 6, c.ink);
+            rect(ex, ey, 4, 4, "#ffffff");
+        }
+        const style = eyes === "open" ? c.eyes : eyes;
+        if (style === "dead") {
+            for (let i = 0; i < 4; i++) {
+                rect(ex + i - 1, ey + i, 1, 1, c.eye === "#ffffff" ? INK : c.eye);
+                rect(ex + 2 - i, ey + i, 1, 1, c.eye === "#ffffff" ? INK : c.eye);
+            }
+        } else if (style === "blink") {
+            rect(ex, ey + 3, 3, 1, c.eye === "#ffffff" ? INK : c.eye);
+        } else if (style === "happy") {
+            const e = c.eye === "#ffffff" ? INK : c.eye;
+            rect(ex, ey + 2, 1, 2, e);
+            rect(ex + 1, ey + 1, 1, 1, e);
+            rect(ex + 2, ey + 2, 1, 2, e);
+        } else if (style === "round") {
+            rect(ex - 1, ey, 5, 5, c.eye);
+            rect(ex + (glance >= 0 ? 1 : 0), ey + 1, 2, 3, c.eye === "#ffffff" ? INK : "#0a3a2c");
+        } else if (style === "smug") {
+            rect(ex - 1, ey + 1, 5, 1, c.ink);
+            rect(ex - 1, ey + 2, 5, 2, c.eye);
+            rect(ex + (glance >= 0 ? 2 : 0), ey + 2, 2, 2, INK);
+        } else if (style === "stalk") {
+            rect(ex + 1, ey + 1, 2, 2, c.eye);
+        } else {
+            const tall = style === "wide" ? 6 : 5;
+            rect(ex, ey - (tall - 5), 3, tall, c.eye);
+            rect(ex, ey - (tall - 5), 1, 1, "#ffffff");
+        }
+    }
+
+    if (parts.clothes.id !== "none" && parts.clothes.id !== "cape") drawClothes(parts.clothes.id, bx, bw, top, bh, bottom);
+    if (parts.eyewear.id !== "none" && eyes !== "dead") drawEyewear(parts.eyewear.id, ex0, ex1, ey, bx, bw);
+    // Copilot's own pilot's cap and goggles, unless it has a hat on
+    if (c.extra === "pilot" && parts.hat.id === "none") {
+        roundBox(bx - 1, top - 6, bw + 2, 9, 4, c.ink);
+        roundBox(bx, top - 5, bw, 7, 4, "#8a5a2c");
+        rect(bx + 4, top - 3, 8, 4, c.ink);
+        rect(bx + 16, top - 3, 8, 4, c.ink);
+        rect(bx + 5, top - 2, 6, 2, "#9fe8ff");
+        rect(bx + 17, top - 2, 6, 2, "#9fe8ff");
+    }
+    if (parts.hat.id !== "none") drawHat(parts.hat.id, cx, top, dir, bx, bw);
+}
+
+// how the player's character stands right now, and which way it faces
 function claudePose() {
+    const { claude } = g;
+    return { ...stance(), dir: claude.dir || 1, moving: claude.left > 0 || !claude.on };
+}
+function stance() {
     const { claude } = g;
     const look = claude.left > 0 ? claude.dir : 0;
     if (claude.rope) return { legs: 7, armsUp: true, eyes: Math.abs(claude.rope.w) > 0.05 ? "happy" : "open", look: Math.sign(claude.rope.w) };
@@ -1644,15 +2028,46 @@ const blinkOn = () => mod(frame >> 4, 2) === 0;
 function drawTitle() {
     dim();
     centered("SKY HOP", HUD + 14, "#ffffff", 24);
-    centered("17 WORLDS OF TECH", HUD + 46, CLAUDE.body);
+    centered("17 WORLDS OF TECH", HUD + 42, CLAUDE.body);
     ctx.save();
-    ctx.translate(VW / 2 - 40, HUD + 58);
+    ctx.translate(VW / 2 - 40, HUD + 76);
     ctx.scale(2, 2);
     drawClaude(0, 24, { bob: mod(frame >> 5, 2), eyes: mod(frame, 200) < 8 ? "blink" : "open" });
     ctx.restore();
-    const lines = ["ARROWS / A D   MOVE", "SPACE  JUMP / LET GO", "W FLAP   S DROP / DOOR", "F  FIRE AT A BOSS", "TAB  CLOCK   M  SOUND"];
-    lines.forEach((line, i) => centered(line, HUD + 118 + i * 14, "#c9c9de"));
-    if (blinkOn()) centered("PRESS SPACE", HUD + 204, "#ffd84a");
+    const lines = ["ARROWS / A D   MOVE", "SPACE  JUMP / LET GO", "W FLAP   S DROP / DOOR", "F  FIRE AT A BOSS", "C STYLE  TAB CLOCK  M SOUND"];
+    lines.forEach((line, i) => centered(line, HUD + 132 + i * 13, "#c9c9de"));
+    if (blinkOn()) centered("PRESS SPACE", HUD + 206, "#ffd84a");
+    centered(`PLAYING AS ${lookParts(g.look).character.name.toUpperCase()}`, HUD + 224, CLAUDE.light);
+}
+
+// the wardrobe: the character big on the left, a row for each thing to wear on the right, and the whole line-up below
+function drawWardrobe() {
+    dim();
+    const parts = lookParts(g.look);
+    centered("WARDROBE", HUD + 8, "#ffffff", 16);
+    ctx.save();
+    ctx.translate(36, HUD + 50);
+    ctx.scale(3, 3);
+    drawClaude(0, 34, { stride: mod(frame >> 4, 2), eyes: mod(frame, 200) < 8 ? "blink" : "open", dir: 1, moving: true });
+    ctx.restore();
+    const name = parts.character.name.toUpperCase();
+    ctx.font = `8px ${FONT}`;
+    text(name, 96 - ctx.measureText(name).width / 2, HUD + 160, "#ffd84a");
+    SLOTS.forEach((slot, i) => {
+        const y = HUD + 46 + i * 28;
+        const on = g.wardrobe.row === i;
+        text(slot.name.toUpperCase(), 176, y, on ? "#ffd84a" : "#8a8aa8");
+        text(`< ${parts[slot.key].name.toUpperCase()} >`, 176, y + 11, on ? "#ffffff" : "#c9c9de");
+        if (on && blinkOn()) text(">", 164, y + 11, "#ffd84a");
+    });
+    CHARACTERS.forEach((who, i) => {
+        const chosen = who.id === parts.character.id;
+        drawClaude(i * 32 - 4, HUD + 196 - (chosen ? 2 + mod(frame >> 4, 2) : 0), { eyes: chosen ? "happy" : "open" }, { character: who.id, hat: "none", eyewear: "none", clothes: "none" });
+    });
+    // on a phone the pad's buttons do it: FLAP and DOWN pick a row, the arrows change it, JUMP is done
+    const touch = matchMedia("(pointer: coarse)").matches;
+    centered(touch ? "FLAP DOWN PICK   < > CHANGE" : "W S PICK   A D CHANGE   X RANDOM", HUD + 212, "#c9c9de");
+    if (blinkOn()) centered(touch ? "JUMP  DONE" : "SPACE  DONE", HUD + 226, "#ffd84a");
 }
 
 function drawOver() {
@@ -1830,7 +2245,7 @@ function draw(alpha) {
         // knocked out: Claude pops up and drops off the bottom of the screen
         const since = clock - deathAt;
         drawClaude(px(deathX), py(deathY) - 90 * since + 320 * since * since, { eyes: "dead", legs: 6 });
-    } else if (!(fight && fight.hurt > 0 && mod(frame >> 2, 2))) {
+    } else if (!g.wardrobe && !(fight && fight.hurt > 0 && mod(frame >> 2, 2))) {
         // just hit: Claude flashes while it can't be hit again
         drawClaude(px(drawnCx), py(drawnCy), claudePose());
     }
@@ -1860,7 +2275,10 @@ function draw(alpha) {
         return;
     }
     drawBanner();
-    if (g.phase === "title") drawTitle();
+    if (g.phase === "title") {
+        if (g.wardrobe) drawWardrobe();
+        else drawTitle();
+    }
     if (g.phase === "over") drawOver();
 }
 
